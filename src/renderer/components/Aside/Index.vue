@@ -23,7 +23,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { mapState } from 'vuex'
   import { ADD_TASK_TYPE } from '@shared/constants'
   import LogoMini from '@/components/Logo/LogoMini'

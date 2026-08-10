@@ -194,7 +194,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { mapState } from 'vuex'
   import { isEmpty } from 'lodash'
   import HistoryDirectory from '@/components/Preference/HistoryDirectory'

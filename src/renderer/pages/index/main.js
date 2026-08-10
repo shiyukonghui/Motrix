@@ -1,5 +1,5 @@
-import is from 'electron-is'
-import { ipcRenderer } from 'electron'
+import { is, ipcRenderer, install } from '@shims'
+import { initEngineEvents } from '@shims/events'
 import Vue from 'vue'
 import VueI18Next from '@panter/vue-i18next'
 import { sync } from 'vuex-router-sync'
@@ -53,7 +53,7 @@ function initTrayWorker () {
 
 function init (config) {
   if (is.renderer()) {
-    Vue.use(require('vue-electron'))
+    Vue.use(install)
   }
 
   Vue.http = Vue.prototype.$http = axios
@@ -80,6 +80,10 @@ function init (config) {
   })
 
   sync(store, router)
+
+  // 订阅 Rust 端 engine:* 事件（全局统计 / 任务快照 → Vuex），
+  // 替代 Electron 版"轮询 + JSON-RPC"状态同步（见 MIGRATION-TAURI.md 5.8）
+  initEngineEvents(store)
 
   /* eslint-disable no-new */
   global.app = new Vue({

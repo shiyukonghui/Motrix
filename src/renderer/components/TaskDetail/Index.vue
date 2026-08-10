@@ -63,7 +63,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { debounce, merge } from 'lodash'
   import {
     calcFormLabelWidth,

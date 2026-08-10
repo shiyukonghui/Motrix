@@ -33,7 +33,7 @@
 </template>
 
 <script>
-  import { dialog } from '@electron/remote'
+  import { dialog } from '@shims'
   import { mapState } from 'vuex'
 
   import { commands } from '@/components/CommandManager/instance'

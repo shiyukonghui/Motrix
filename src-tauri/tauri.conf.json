@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Motrix",
+  "version": "1.8.19",
+  "identifier": "com.motrix.app",
+  "build": {
+    "frontendDist": "../dist/web",
+    "devUrl": "http://localhost:9080"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Motrix",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 800,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
+}

@@ -3,9 +3,10 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { mapState } from 'vuex'
   import api from '@/api'
+  import { onTaskEvent } from '@shims/events'
   import {
     getTaskFullPath,
     showItemInFolder
@@ -20,7 +21,6 @@
         uploadSpeed: state => state.stat.uploadSpeed,
         downloadSpeed: state => state.stat.downloadSpeed,
         speed: state => state.stat.uploadSpeed + state.stat.downloadSpeed,
-        interval: state => state.interval,
         downloading: state => state.stat.numActive > 0,
         progress: state => state.progress
       }),
@@ -63,6 +63,34 @@
             console.warn(`fetchTaskItem fail: ${e.message}`)
           })
       },
+      // Task 11：engine:task-event 事件分发（{ gid, event } → 对应通知处理方法）。
+      // event 取值 start/stop/pause/complete/error/bt-complete，与原 aria2 通知语义一致。
+      dispatchTaskEvent ({ gid, event }) {
+        // 兼容原处理方法的签名（接收 [{ gid }] 数组）
+        const payload = [{ gid }]
+        switch (event) {
+        case 'start':
+          this.onDownloadStart(payload)
+          break
+        case 'pause':
+          this.onDownloadPause(payload)
+          break
+        case 'stop':
+          this.onDownloadStop(payload)
+          break
+        case 'complete':
+          this.onDownloadComplete(payload)
+          break
+        case 'error':
+          this.onDownloadError(payload)
+          break
+        case 'bt-complete':
+          this.onBtDownloadComplete(payload)
+          break
+        default:
+          console.warn(`[Motrix] 未识别的任务事件: ${event}`)
+        }
+      },
       onDownloadStart (event) {
         this.$store.dispatch('task/fetchList')
         this.$store.dispatch('app/resetInterval')
@@ -75,6 +103,9 @@
 
         this.fetchTaskItem({ gid })
           .then((task) => {
+            if (!task) {
+              return
+            }
             const { dir } = task
             this.$store.dispatch('preference/recordHistoryDirectory', dir)
             const taskName = getTaskName(task)
@@ -91,6 +122,9 @@
 
         this.fetchTaskItem({ gid })
           .then((task) => {
+            if (!task) {
+              return
+            }
             const taskName = getTaskName(task)
             const message = this.$t('task.download-pause-message', { taskName })
             this.$msg.info(message)
@@ -100,6 +134,9 @@
         const [{ gid }] = event
         this.fetchTaskItem({ gid })
           .then((task) => {
+            if (!task) {
+              return
+            }
             const taskName = getTaskName(task)
             const message = this.$t('task.download-stop-message', { taskName })
             this.$msg.info(message)
@@ -109,6 +146,9 @@
         const [{ gid }] = event
         this.fetchTaskItem({ gid })
           .then((task) => {
+            if (!task) {
+              return
+            }
             const taskName = getTaskName(task)
             const { errorCode, errorMessage } = task
             console.error(`[Motrix] download error gid: ${gid}, #${errorCode}, ${errorMessage}`)
@@ -149,6 +189,9 @@
           })
       },
       handleDownloadComplete (task, isBT) {
+        if (!task) {
+          return
+        }
         this.$store.dispatch('task/saveSession')
 
         const path = getTaskFullPath(task)
@@ -198,64 +241,30 @@
         new Notification(this.$t('task.download-fail-notify'), {
           body: taskName
         })
-      },
-      bindEngineEvents () {
-        api.client.on('onDownloadStart', this.onDownloadStart)
-        // api.client.on('onDownloadPause', this.onDownloadPause)
-        api.client.on('onDownloadStop', this.onDownloadStop)
-        api.client.on('onDownloadComplete', this.onDownloadComplete)
-        api.client.on('onDownloadError', this.onDownloadError)
-        api.client.on('onBtDownloadComplete', this.onBtDownloadComplete)
-      },
-      unbindEngineEvents () {
-        api.client.removeListener('onDownloadStart', this.onDownloadStart)
-        // api.client.removeListener('onDownloadPause', this.onDownloadPause)
-        api.client.removeListener('onDownloadStop', this.onDownloadStop)
-        api.client.removeListener('onDownloadComplete', this.onDownloadComplete)
-        api.client.removeListener('onDownloadError', this.onDownloadError)
-        api.client.removeListener('onBtDownloadComplete', this.onBtDownloadComplete)
-      },
-      startPolling () {
-        this.timer = setTimeout(() => {
-          this.polling()
-          this.startPolling()
-        }, this.interval)
-      },
-      polling () {
-        this.$store.dispatch('app/fetchGlobalStat')
-        this.$store.dispatch('app/fetchProgress')
-        this.$store.dispatch('task/fetchList')
-
-        if (this.taskDetailVisible && this.currentTaskGid) {
-          if (this.currentTaskIsBT && this.enabledFetchPeers) {
-            this.$store.dispatch('task/fetchItemWithPeers', this.currentTaskGid)
-          } else {
-            this.$store.dispatch('task/fetchItem', this.currentTaskGid)
-          }
-        }
-      },
-      stopPolling () {
-        clearTimeout(this.timer)
-        this.timer = null
       }
     },
     created () {
-      this.bindEngineEvents()
+      // Task 11：订阅 engine:task-event（Rust 端经 TaskManager 事件通道转发），
+      // 分发到 onDownloadStart / onDownloadPause / onDownloadStop / onDownloadComplete /
+      // onDownloadError / onBtDownloadComplete 等通知处理方法（替代原 aria2 WS 通知绑定）
+      this.unlistenTaskEvent = onTaskEvent((data) => {
+        this.dispatchTaskEvent(data)
+      })
     },
     mounted () {
       setTimeout(() => {
         this.$store.dispatch('app/fetchEngineInfo')
         this.$store.dispatch('app/fetchEngineOptions')
-
-        this.startPolling()
+        // 状态同步已由 engine:* 事件驱动（见 src/shims/events.js），不再轮询
       }, 100)
     },
     destroyed () {
       this.$store.dispatch('task/saveSession')
 
-      this.unbindEngineEvents()
-
-      this.stopPolling()
+      if (this.unlistenTaskEvent) {
+        this.unlistenTaskEvent()
+        this.unlistenTaskEvent = null
+      }
     }
   }
 </script>

@@ -1,0 +1,24 @@
+[package]
+name = "motrix-core"
+version = "0.1.0"
+edition = "2021"
+description = "Motrix 核心库：配置读写、任务模型、下载引擎封装（GUI 与 CLI 共享）"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+# 任务状态变化事件通道（Task 11）：TaskManager 用 tokio broadcast 发布 TaskEvent，
+# 由 src-tauri 的 async 循环订阅并转发为 engine:task-event（send 不 await，可在同步上下文使用）
+tokio = { workspace = true }
+# KGet 下载引擎（crates.io 包名 "Kget"，v1.7 锁定，default-features 关闭：HTTP/FTP 等内置能力已足够，避免 gui/torrent 重依赖）
+Kget = { workspace = true }
+
+[dev-dependencies]
+# 集成测试（tests/）使用：engine_integration.rs 的事件流测试轮询 broadcast 通道（TryRecvError）
+tokio = { workspace = true }
+# 集成测试构造任务 options JSON（json! 宏）
+serde_json = { workspace = true }

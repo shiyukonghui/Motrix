@@ -441,8 +441,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
-  import { dialog } from '@electron/remote'
+  import { is, dialog } from '@shims'
   import { mapState } from 'vuex'
   import { cloneDeep, extend, isEmpty } from 'lodash'
   import randomize from 'randomatic'

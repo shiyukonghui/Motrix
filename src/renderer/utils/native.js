@@ -1,6 +1,5 @@
-import { access, constants } from 'node:fs'
-import { resolve } from 'node:path'
-import { shell, nativeTheme } from '@electron/remote'
+import { shell } from '@shims/remote-shell'
+import { nativeTheme } from '@shims/remote-nativeTheme'
 import { Message } from 'element-ui'
 
 import {
@@ -8,6 +7,30 @@ import {
   isMagnetTask
 } from '@shared/utils'
 import { APP_THEME, TASK_STATUS } from '@shared/constants'
+
+// Tauri WebView has no Node.js `fs` / `path` modules, so we use lightweight
+// browser-safe replacements here. The paths are already absolute strings
+// coming from the download engine.
+const resolve = (...args) => {
+  const parts = args.filter((item) => typeof item === 'string' && item.length > 0)
+  if (parts.length === 0) {
+    return ''
+  }
+
+  return parts
+    .map((item) => item.replace(/\\/g, '/'))
+    .join('/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/+$/, '')
+}
+
+const constants = { F_OK: 0 }
+
+// fs.access fallback: the file system is not reachable from the WebView,
+// so the file is always treated as existing.
+const access = (fullPath, mode, callback) => {
+  callback(null)
+}
 
 export const showItemInFolder = (fullPath, { errorMsg }) => {
   if (!fullPath) {

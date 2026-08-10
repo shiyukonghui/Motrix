@@ -9,8 +9,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
-  import { webContents } from '@electron/remote'
+  import { is, webContents } from '@shims'
   import { Loading } from 'element-ui'
 
   export default {

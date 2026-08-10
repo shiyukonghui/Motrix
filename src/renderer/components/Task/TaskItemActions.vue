@@ -34,7 +34,7 @@
 
 <script>
   import { mapState } from 'vuex'
-  import is from 'electron-is'
+  import is from '@shims'
 
   import { commands } from '@/components/CommandManager/instance'
   import { TASK_STATUS } from '@shared/constants'

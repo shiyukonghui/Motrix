@@ -17,7 +17,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { mapState } from 'vuex'
 
   import { APP_THEME } from '@shared/constants'

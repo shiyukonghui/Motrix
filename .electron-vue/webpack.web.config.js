@@ -21,7 +21,7 @@ const devMode = process.env.NODE_ENV !== 'production'
  * that provide pure *.vue files that need compiling
  * https://simulatedgreg.gitbooks.io/electron-vue/content/en/webpack-configurations.html#white-listing-externals
  */
-let whiteListedModules = ['vue']
+let whiteListedModules = ['vue', '@tauri-apps/api']
 
 let webConfig = {
   entry: {
@@ -48,7 +48,7 @@ let webConfig = {
             loader: 'sass-loader',
             options: {
               implementation: require('sass'),
-              additionalData: '@import "@/components/Theme/Variables.scss"',
+              additionalData: '@import "@/components/Theme/Variables.scss";',
               sassOptions: {
                 includePaths:[__dirname, 'src']
               }
@@ -66,7 +66,7 @@ let webConfig = {
             options: {
               implementation: require('sass'),
               indentedSyntax: true,
-              additionalData: '@import "@/components/Theme/Variables.scss"',
+              additionalData: '@import "@/components/Theme/Variables.scss";',
               sassOptions: {
                 includePaths:[__dirname, 'src']
               }
@@ -92,7 +92,10 @@ let webConfig = {
       {
         test: /\.js$/,
         use: 'babel-loader',
-        include: [ path.resolve(__dirname, '../src/renderer') ],
+        include: [
+          path.resolve(__dirname, '../src/renderer'),
+          path.resolve(__dirname, '../src/shims')
+        ],
         exclude: /node_modules/
       },
       {
@@ -158,9 +161,20 @@ let webConfig = {
     publicPath: ''
   },
   resolve: {
+    // The web build has no Node.js built-ins. `path` is provided by a minimal
+    // browser-safe polyfill (needed by parse-torrent), the rest are empty
+    // modules (only used by code paths the UI never reaches, e.g. simple-get).
+    fallback: {
+      path: path.join(__dirname, '../src/shims/path.js'),
+      http: false,
+      https: false,
+      querystring: false,
+      url: false
+    },
     alias: {
       '@': path.join(__dirname, '../src/renderer'),
       '@shared': path.join(__dirname, '../src/shared'),
+      '@shims': path.join(__dirname, '../src/shims'),
       'vue$': 'vue/dist/vue.esm.js'
     },
     extensions: ['.js', '.vue', '.json', '.css']
@@ -192,7 +206,7 @@ if (!devMode) {
     new CopyWebpackPlugin({
       patterns: [{
         from: path.join(__dirname, '../static'),
-        to: path.join(__dirname, '../dist/electron/static'),
+        to: path.join(__dirname, '../dist/web/static'),
         globOptions: { ignore: [ '.*' ] }
       }]
     }),

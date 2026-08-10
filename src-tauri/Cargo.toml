@@ -1,0 +1,30 @@
+[package]
+name = "motrix-tauri"
+version = "1.8.19"
+edition = "2021"
+description = "Motrix Tauri 2 应用壳（GUI）"
+license = "MIT"
+
+# 库入口：main.rs 调用 motrix_tauri_lib::run()
+[lib]
+name = "motrix_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+# 核心库：配置读写等（path 依赖共享 workspace 代码）
+motrix-core = { path = "../crates/motrix-core" }
+# aria2 兼容 JSON-RPC 服务（Task 7：lib.rs 启动 JsonRpcServer + CoreRpcBackend）
+motrix-rpc = { path = "../crates/motrix-rpc" }
+# 广播循环自适应间隔定时（Task 7：tauri::async_runtime::spawn + tokio::time::sleep）
+tokio = { workspace = true }
+# 占位 gid 生成用随机数（Phase 1 任务操作占位）
+rand = { workspace = true }

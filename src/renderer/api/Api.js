@@ -1,16 +1,34 @@
-import { ipcRenderer } from 'electron'
-import is from 'electron-is'
-import { isEmpty, clone } from 'lodash'
-import { Aria2 } from '@shared/aria2'
+// Api.js：前端数据管线（Task 11 改造）
+//
+// 由「高频轮询 + WebSocket JSON-RPC（@shared/aria2）」切换为：
+// - 操作类方法 → Tauri command（invoke）：add_uri / pause_task / resume_task /
+//   remove_task / change_option / change_global_option / get_global_stat 等；
+// - 查询类方法 → 事件数据 / 按需 invoke：任务列表来自 engine:snapshot 事件
+//   （src/shims/events.js 驱动 Vuex 增量更新），详情按需 invoke('get_task_detail')，
+//   全局统计按需 invoke('get_global_stat')；
+// - 配置读写（get-app-config / application:save-preference）继续走 shim 通道。
+//
+// 保留类结构与全部方法名（store / commands.js / 视觉组件调用方无需改动），
+// @shared/utils 的 formatOptionsForEngine / changeKeysToCamelCase 等继续使用。
+// 对应 MIGRATION-TAURI.md 5.8 / 8.2 与 tasks.md Task 11。
+import { invoke } from '@tauri-apps/api/core'
+import { ipcRenderer } from '@shims'
+import { isEmpty } from 'lodash'
 import {
   separateConfig,
-  compactUndefined,
   formatOptionsForEngine,
-  mergeTaskResult,
   changeKeysToCamelCase,
   changeKeysToKebabCase
 } from '@shared/utils'
-import { ENGINE_RPC_HOST } from '@shared/constants'
+
+// 批量方法 → 单任务 command 的映射（Task 11：优先循环调用，减少 Rust 批量 command）
+const BATCH_METHOD_MAP = {
+  'aria2.changeOption': (gid, options) => invoke('change_option', { gid, options }),
+  'aria2.remove': (gid) => invoke('remove_task', { gid }),
+  'aria2.unpause': (gid) => invoke('resume_task', { gid }),
+  'aria2.pause': (gid) => invoke('pause_task', { gid }),
+  'aria2.forcePause': (gid) => invoke('pause_task', { gid })
+}
 
 export default class Api {
   constructor (options = {}) {
@@ -21,9 +39,6 @@ export default class Api {
 
   async init () {
     this.config = await this.loadConfig()
-
-    this.client = this.initClient()
-    this.client.open()
   }
 
   loadConfigFromLocalStorage () {
@@ -33,40 +48,15 @@ export default class Api {
   }
 
   async loadConfigFromNativeStore () {
+    // get-app-config 仍走 shim（Phase 0 已打通 Tauri command 通道）
     const result = await ipcRenderer.invoke('get-app-config')
     return result
   }
 
   async loadConfig () {
-    let result = is.renderer()
-      ? await this.loadConfigFromNativeStore()
-      : this.loadConfigFromLocalStorage()
-
+    let result = await this.loadConfigFromNativeStore()
     result = changeKeysToCamelCase(result)
     return result
-  }
-
-  initClient () {
-    const {
-      rpcListenPort: port,
-      rpcSecret: secret
-    } = this.config
-    const host = ENGINE_RPC_HOST
-    return new Aria2({
-      host,
-      port,
-      secret
-    })
-  }
-
-  closeClient () {
-    this.client.close()
-      .then(() => {
-        this.client = null
-      })
-      .catch(err => {
-        console.log('engine client close fail', err)
-      })
   }
 
   fetchPreference () {
@@ -78,11 +68,7 @@ export default class Api {
 
   savePreference (params = {}) {
     const kebabParams = changeKeysToKebabCase(params)
-    if (is.renderer()) {
-      return this.savePreferenceToNativeStore(kebabParams)
-    } else {
-      return this.savePreferenceToLocalStorage(kebabParams)
-    }
+    return this.savePreferenceToNativeStore(kebabParams)
   }
 
   savePreferenceToLocalStorage () {
@@ -111,35 +97,36 @@ export default class Api {
     ipcRenderer.send('command', 'application:save-preference', config)
   }
 
+  // ==================================================================
+  // 查询方法：Tauri command（按需 invoke）/ 事件数据
+  // ==================================================================
+
   getVersion () {
-    return this.client.call('getVersion')
+    // get_engine_info 返回 { version, enabledFeatures }（与 aria2.getVersion 对齐）
+    return invoke('get_engine_info')
   }
 
   changeGlobalOption (options) {
     const args = formatOptionsForEngine(options)
 
-    return this.client.call('changeGlobalOption', args)
+    return invoke('change_global_option', { options: args })
   }
 
   getGlobalOption () {
-    return new Promise((resolve) => {
-      this.client.call('getGlobalOption')
-        .then((data) => {
-          resolve(changeKeysToCamelCase(data))
-        })
-    })
+    // get_global_option 返回 kebab 键基础子集，转换回驼峰（与旧 JSON-RPC 行为一致）
+    return invoke('get_global_option')
+      .then((data) => {
+        return changeKeysToCamelCase(data)
+      })
   }
 
   getOption (params = {}) {
-    const { gid } = params
-    const args = compactUndefined([gid])
-
-    return new Promise((resolve) => {
-      this.client.call('getOption', ...args)
-        .then((data) => {
-          resolve(changeKeysToCamelCase(data))
-        })
-    })
+    // 无单任务选项 command：以全局选项近似（含 dir / split / header，
+    // 供 Task/Index.vue handleRestartTask 重建任务选项）
+    return invoke('get_global_option')
+      .then((data) => {
+        return changeKeysToCamelCase(data)
+      })
   }
 
   updateActiveTaskOption (options) {
@@ -158,87 +145,68 @@ export default class Api {
     const { gid, options = {} } = params
 
     const engineOptions = formatOptionsForEngine(options)
-    const args = compactUndefined([gid, engineOptions])
 
-    return this.client.call('changeOption', ...args)
+    return invoke('change_option', { gid, options: engineOptions })
   }
 
   getGlobalStat () {
-    return this.client.call('getGlobalStat')
+    // get_global_stat 返回字符串数值（aria2 惯例），保持旧形状由调用方 Number() 转换
+    return invoke('get_global_stat')
   }
 
-  addUri (params) {
-    const {
-      uris,
-      outs,
-      options
-    } = params
-    const tasks = uris.map((uri, index) => {
-      const engineOptions = formatOptionsForEngine(options)
-      if (outs && outs[index]) {
-        engineOptions.out = outs[index]
-      }
-      const args = compactUndefined([[uri], engineOptions])
-      return ['aria2.addUri', ...args]
-    })
-    return this.client.multicall(tasks)
+  // —— 任务列表：按需 invoke('get_tasks') 后客户端按 status 过滤（分页切片） ——
+
+  // 获取全部在册任务（get_tasks 返回 aria2 兼容 JSON 数组；不含 removed 历史）
+  fetchAllTasks () {
+    return invoke('get_tasks')
+      .then((tasks) => {
+        return Array.isArray(tasks) ? tasks : []
+      })
   }
 
-  addTorrent (params) {
-    const {
-      torrent,
-      options
-    } = params
-    const engineOptions = formatOptionsForEngine(options)
-    const args = compactUndefined([torrent, [], engineOptions])
-    return this.client.call('addTorrent', ...args)
-  }
-
-  addMetalink (params) {
-    const {
-      metalink,
-      options
-    } = params
-    const engineOptions = formatOptionsForEngine(options)
-    const args = compactUndefined([metalink, engineOptions])
-    return this.client.call('addMetalink', ...args)
+  // offset/num 分页切片（与旧 tellWaiting/tellStopped 的 offset/num 语义一致）
+  sliceTaskList (tasks, offset = 0, num = 20) {
+    return tasks.slice(offset, offset + num)
   }
 
   fetchDownloadingTaskList (params = {}) {
-    const { offset = 0, num = 20, keys } = params
-    const activeArgs = compactUndefined([keys])
-    const waitingArgs = compactUndefined([offset, num, keys])
-    return new Promise((resolve, reject) => {
-      this.client.multicall([
-        ['aria2.tellActive', ...activeArgs],
-        ['aria2.tellWaiting', ...waitingArgs]
-      ]).then((data) => {
-        console.log('[Motrix] fetch downloading task list data:', data)
-        const result = mergeTaskResult(data)
-        resolve(result)
-      }).catch((err) => {
-        console.log('[Motrix] fetch downloading task list fail:', err)
-        reject(err)
+    // 下载中视图 = active + waiting（与旧 tellActive + tellWaiting 合并一致）
+    const { offset = 0, num = 20 } = params
+    return this.fetchAllTasks()
+      .then((tasks) => {
+        const filtered = tasks.filter((task) => {
+          return task.status === 'active' || task.status === 'waiting'
+        })
+        return this.sliceTaskList(filtered, offset, num)
       })
-    })
   }
 
   fetchWaitingTaskList (params = {}) {
-    const { offset = 0, num = 20, keys } = params
-    const args = compactUndefined([offset, num, keys])
-    return this.client.call('tellWaiting', ...args)
+    const { offset = 0, num = 20 } = params
+    return this.fetchAllTasks()
+      .then((tasks) => {
+        const filtered = tasks.filter((task) => task.status === 'waiting')
+        return this.sliceTaskList(filtered, offset, num)
+      })
   }
 
   fetchStoppedTaskList (params = {}) {
-    const { offset = 0, num = 20, keys } = params
-    const args = compactUndefined([offset, num, keys])
-    return this.client.call('tellStopped', ...args)
+    const { offset = 0, num = 20 } = params
+    return this.fetchAllTasks()
+      .then((tasks) => {
+        const filtered = tasks.filter((task) => {
+          return ['complete', 'error', 'removed'].includes(task.status)
+        })
+        return this.sliceTaskList(filtered, offset, num)
+      })
   }
 
   fetchActiveTaskList (params = {}) {
-    const { keys } = params
-    const args = compactUndefined([keys])
-    return this.client.call('tellActive', ...args)
+    // 供 app/fetchProgress 计算全局进度使用（基于当前仓库数据，非轮询）
+    return this.fetchAllTasks()
+      .then((tasks) => {
+        return tasks.filter((task) => task.status === 'active')
+      })
   }
 
   fetchTaskList (params = {}) {
@@ -255,108 +223,147 @@ export default class Api {
     }
   }
 
+  // —— 任务详情：按需 invoke（详情面板打开时才调用，见 MIGRATION-TAURI.md 5.8） ——
+
   fetchTaskItem (params = {}) {
-    const { gid, keys } = params
-    const args = compactUndefined([gid, keys])
-    return this.client.call('tellStatus', ...args)
+    const { gid } = params
+    return invoke('get_task_detail', { gid })
   }
 
   fetchTaskItemWithPeers (params = {}) {
-    const { gid, keys } = params
-    const statusArgs = compactUndefined([gid, keys])
-    const peersArgs = compactUndefined([gid])
-    return new Promise((resolve, reject) => {
-      this.client.multicall([
-        ['aria2.tellStatus', ...statusArgs],
-        ['aria2.getPeers', ...peersArgs]
-      ]).then((data) => {
-        console.log('[Motrix] fetchTaskItemWithPeers:', data)
-        const result = data[0] && data[0][0]
-        const peers = data[1] && data[1][0]
-        result.peers = peers || []
-        console.log('[Motrix] fetchTaskItemWithPeers.result:', result)
-        console.log('[Motrix] fetchTaskItemWithPeers.peers:', peers)
-
-        resolve(result)
-      }).catch((err) => {
-        console.log('[Motrix] fetch downloading task list fail:', err)
-        reject(err)
+    const { gid } = params
+    // BT peers 属 Phase 3：详情走 get_task_detail，peers 占位空数组
+    return invoke('get_task_detail', { gid })
+      .then((result) => {
+        const task = result || {}
+        task.peers = []
+        return task
       })
-    })
   }
 
   fetchTaskItemPeers (params = {}) {
-    const { gid, keys } = params
-    const args = compactUndefined([gid, keys])
-    return this.client.call('getPeers', ...args)
+    // BT peers 属 Phase 3：返回空数组占位（保持旧形状，视觉组件不感知）
+    return Promise.resolve([])
+  }
+
+  // ==================================================================
+  // 操作类方法：Tauri command（invoke）
+  // ==================================================================
+
+  addUri (params) {
+    const {
+      uris,
+      outs,
+      options
+    } = params
+    // 每个 URL 单独 invoke（Rust 端 add_uri 对每个 URL 创建独立任务）；
+    // outs 存在时把对应文件名写入该 URL 的 options.out（与旧 multicall 行为一致）
+    const tasks = uris.map((uri, index) => {
+      const engineOptions = formatOptionsForEngine(options)
+      if (outs && outs[index]) {
+        engineOptions.out = outs[index]
+      }
+      return invoke('add_uri', { uris: [uri], options: engineOptions })
+    })
+    return Promise.all(tasks).then((results) => {
+      // 返回 gid 数组（各 URL 的 gid 按序扁平合并，保持旧返回形状）
+      return [].concat(...results)
+    })
+  }
+
+  addTorrent (params) {
+    const {
+      torrent,
+      options
+    } = params
+    const engineOptions = formatOptionsForEngine(options)
+    // add_torrent 在 Phase 2 返回明确占位错误（BT 属 Phase 3），前端已有处理
+    return invoke('add_torrent', { torrent, options: engineOptions })
+  }
+
+  addMetalink (params) {
+    // addMetalink 前端无触发入口（commands.js 中为 TODO），返回明确占位错误
+    return Promise.reject(new Error('addMetalink 未支持（Phase 3 提供）'))
   }
 
   pauseTask (params = {}) {
     const { gid } = params
-    const args = compactUndefined([gid])
-    return this.client.call('pause', ...args)
+    return invoke('pause_task', { gid })
   }
 
   pauseAllTask (params = {}) {
-    return this.client.call('pauseAll')
+    // aria2.pauseAll：暂停全部下载中/排队任务（无批量 command，逐个 invoke）
+    return this.fetchDownloadingTaskList()
+      .then((tasks) => {
+        return Promise.all(tasks.map((task) => this.pauseTask({ gid: task.gid })))
+      })
   }
 
   forcePauseTask (params = {}) {
     const { gid } = params
-    const args = compactUndefined([gid])
-    return this.client.call('forcePause', ...args)
+    // KGet abort 本身就是强停，普通/强制暂停行为一致（pause_task 无 force 参数）
+    return invoke('pause_task', { gid })
   }
 
   forcePauseAllTask (params = {}) {
-    return this.client.call('forcePauseAll')
+    return this.fetchDownloadingTaskList()
+      .then((tasks) => {
+        return Promise.all(tasks.map((task) => this.forcePauseTask({ gid: task.gid })))
+      })
   }
 
   resumeTask (params = {}) {
     const { gid } = params
-    const args = compactUndefined([gid])
-    return this.client.call('unpause', ...args)
+    return invoke('resume_task', { gid })
   }
 
   resumeAllTask (params = {}) {
-    return this.client.call('unpauseAll')
+    // aria2.unpauseAll：恢复全部暂停/排队任务（无批量 command，逐个 invoke）
+    return this.fetchAllTasks()
+      .then((tasks) => {
+        const resumed = tasks.filter((task) => {
+          return task.status === 'paused' || task.status === 'waiting'
+        })
+        return Promise.all(resumed.map((task) => this.resumeTask({ gid: task.gid })))
+      })
   }
 
   removeTask (params = {}) {
     const { gid } = params
-    const args = compactUndefined([gid])
-    return this.client.call('remove', ...args)
+    return invoke('remove_task', { gid })
   }
 
   forceRemoveTask (params = {}) {
     const { gid } = params
-    const args = compactUndefined([gid])
-    return this.client.call('forceRemove', ...args)
+    return invoke('remove_task', { gid, force: true })
   }
 
   saveSession (params = {}) {
-    return this.client.call('saveSession')
+    return invoke('save_session')
   }
 
   purgeTaskRecord (params = {}) {
-    return this.client.call('purgeDownloadResult')
+    return invoke('purge')
   }
 
   removeTaskRecord (params = {}) {
     const { gid } = params
-    const args = compactUndefined([gid])
-    return this.client.call('removeDownloadResult', ...args)
+    // 无独立 removeDownloadResult command：对在册任务等价 remove_task
+    // （终态 complete/error 任务可移除进入 stopped 历史）
+    return invoke('remove_task', { gid })
   }
+
+  // —— 批量方法：循环调用单任务 command（优先循环，减少 Rust 批量改动） ——
 
   multicall (method, params = {}) {
     let { gids, options = {} } = params
     options = formatOptionsForEngine(options)
 
-    const data = gids.map((gid, index) => {
-      const _options = clone(options)
-      const args = compactUndefined([gid, _options])
-      return [method, ...args]
-    })
-    return this.client.multicall(data)
+    const caller = BATCH_METHOD_MAP[method]
+    if (!caller) {
+      return Promise.reject(new Error(`未支持的批量方法: ${method}`))
+    }
+    return Promise.all(gids.map((gid) => caller(gid, options)))
   }
 
   batchChangeOption (params = {}) {

@@ -16,7 +16,7 @@
 </template>
 
 <script>
-  import { getCurrentWindow } from '@electron/remote'
+  import { getCurrentWindow } from '@shims'
   import '@/components/Icons/win-minimize'
   import '@/components/Icons/win-maximize'
   import '@/components/Icons/win-close'

@@ -25,6 +25,37 @@ const mutations = {
   UPDATE_TASK_LIST (state, taskList) {
     state.taskList = taskList
   },
+  // 增量合并任务列表（Task 11.4）：以 gid 为键合并，仅替换/新增/删除，
+  // 不做全量数组替换，减少 Vue 重渲染（engine:snapshot 事件驱动）。
+  // - 仍在新列表中的任务：原地合并字段（保留对象引用，仅字段变化触发局部更新）；
+  // - 新列表新增的任务：追加到列表末尾（保持视图顺序）；
+  // - 新列表缺失的任务：视为已移除，从列表中删除。
+  MERGE_TASKS (state, taskList) {
+    const incomingGids = {}
+    taskList.forEach((task) => {
+      incomingGids[task.gid] = true
+    })
+
+    const map = {}
+    const order = []
+    // 保留仍在新列表中的旧任务（新列表缺失的 gid 直接丢弃）
+    state.taskList.forEach((task) => {
+      if (incomingGids[task.gid]) {
+        map[task.gid] = task
+        order.push(task.gid)
+      }
+    })
+    // 合并新列表：已存在的任务原地合并字段，新增任务追加到末尾
+    taskList.forEach((task) => {
+      if (map[task.gid]) {
+        Object.assign(map[task.gid], task)
+      } else {
+        map[task.gid] = task
+        order.push(task.gid)
+      }
+    })
+    state.taskList = order.map((gid) => map[gid])
+  },
   UPDATE_SELECTED_GID_LIST (state, gidList) {
     state.selectedGidList = gidList
   },

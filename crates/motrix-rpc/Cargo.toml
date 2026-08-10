@@ -1,0 +1,21 @@
+[package]
+name = "motrix-rpc"
+version = "0.1.0"
+edition = "2021"
+description = "Motrix aria2 兼容 JSON-RPC 服务（WS + HTTP POST 双通道，对外接口）"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# 测试用：tower 的 ServiceExt::oneshot 直调 Router；tokio-tungstenite 作 WS 客户端
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+tower = { workspace = true }

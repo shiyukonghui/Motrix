@@ -14,7 +14,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { mapGetters, mapState } from 'vuex'
   import { APP_RUN_MODE, APP_THEME } from '@shared/constants'
   import DynamicTray from '@/components/Native/DynamicTray'

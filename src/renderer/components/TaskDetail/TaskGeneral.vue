@@ -77,7 +77,7 @@
 </template>
 
 <script>
-  import is from 'electron-is'
+  import is from '@shims'
   import { mapState } from 'vuex'
   import {
     bytesToSize,

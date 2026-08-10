@@ -15,7 +15,7 @@
   import { mapState } from 'vuex'
   import AppInfo from '@/components/About/AppInfo'
   import Copyright from '@/components/About/Copyright'
-  import { app } from '@electron/remote'
+  import { app } from '@shims'
 
   export default {
     name: 'mo-about-panel',

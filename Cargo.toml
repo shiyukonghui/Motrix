@@ -1,0 +1,33 @@
+# Motrix 工作区根配置
+# 工作区包含：Tauri 2 应用壳（src-tauri）与共享核心库（crates/*），
+# GUI 与后续的 motrix-cli 复用同一份 motrix-core 引擎代码。
+[workspace]
+members = [
+    "src-tauri",
+    "crates/motrix-core",
+    "crates/motrix-rpc"
+]
+resolver = "2"
+
+# 统一声明共享依赖版本，子 crate 通过 `xxx.workspace = true` 形式引用
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+thiserror = "2"
+tracing = "0.1"
+dirs = "6"
+# 任务操作占位 gid 生成（Phase 1 Task 6）
+rand = "0.8"
+# motrix-core：下载引擎 KGet（crates.io 包名为 "Kget"，v1.7 精确锁定，MIT；
+# Rust 库名为 kget，代码中 `use kget::...`）。
+# 调研结论（docs.rs 1.7.0 + GitHub Cargo.toml）：`default = []` 无默认特性，
+# HTTP/HTTPS/FTP/SFTP/WebDAV 均为内置非 optional 能力；gui/torrent-native 等
+# 重特性默认不启用，故显式关闭默认特性即可获得最精简依赖树。
+Kget = { version = "=1.7.0", default-features = false }
+# motrix-rpc：JSON-RPC 服务（axum WS + HTTP POST）、错误类型与测试支撑
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
