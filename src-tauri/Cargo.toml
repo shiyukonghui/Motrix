@@ -28,3 +28,5 @@ motrix-rpc = { path = "../crates/motrix-rpc" }
 tokio = { workspace = true }
 # 占位 gid 生成用随机数（Phase 1 任务操作占位）
 rand = { workspace = true }
+# 原生 shell 能力（Task 3）：跨平台"移到回收站"（trash_item 命令）
+trash = "5"

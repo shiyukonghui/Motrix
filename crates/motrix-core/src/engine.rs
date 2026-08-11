@@ -68,6 +68,12 @@ pub struct TaskManager {
     task_uris: Mutex<HashMap<String, Vec<String>>>,
     /// gid -> 任务级引擎选项（change_option 更新，spawn 时使用）
     task_options: Mutex<HashMap<String, EngineOptions>>,
+    /// gid -> 上次速度采样的 (已完成字节, 采样时刻)
+    ///
+    /// KGet 的 Progress 事件不带实时速度（speed 恒 0），由 handle_progress
+    /// 按"进度差值 / 时间差"自算瞬时速度（每 100ms 采样一次）。暂停 /
+    /// 失败 / 完成 / 移除任务时移除对应记录，保证恢复后重新采样。
+    speed_samples: Mutex<HashMap<String, (u64, std::time::Instant)>>,
     /// 最大并发下载数（对应 max-concurrent-downloads，最小 1）
     max_concurrent: Mutex<u32>,
     /// 自引用（Weak）：引擎线程回调需要升级为 Arc<TaskManager> 再调用方法
@@ -98,6 +104,7 @@ impl TaskManager {
             active: Mutex::new(HashMap::new()),
             task_uris: Mutex::new(HashMap::new()),
             task_options: Mutex::new(HashMap::new()),
+            speed_samples: Mutex::new(HashMap::new()),
             max_concurrent: Mutex::new(max_concurrent),
             self_arc: Mutex::new(None),
             events,
@@ -243,6 +250,11 @@ impl TaskManager {
         // 2. 清理 KGet 预分配可能留下的"假文件"（见 cleanup_partial_file 注释），
         //    保证恢复时不会误判为已下载完成
         self.cleanup_partial_file(gid);
+        // 2.5 清理速度采样快照（引擎已停止，暂停期间速度无意义；独立短锁，
+        //    恢复时从头重新采样）
+        if let Ok(mut samples) = self.speed_samples.lock() {
+            samples.remove(gid);
+        }
         // 3. 状态迁移：active / waiting → paused；paused 幂等
         {
             let mut repo = self
@@ -400,6 +412,10 @@ impl TaskManager {
             .lock()
             .map_err(|e| format!("获取任务选项锁失败: {e}"))?
             .remove(gid);
+        // 清理速度采样快照（独立短锁，不嵌套 repo 锁）
+        if let Ok(mut samples) = self.speed_samples.lock() {
+            samples.remove(gid);
+        }
         // 3. 从仓库移除（进入 removed 历史，供 stopped 列表展示）
         {
             let mut repo = self
@@ -703,10 +719,13 @@ impl TaskManager {
         let _ = repo.update_progress(gid, completed, total, d_speed, u_speed, 1);
     }
 
-    /// Progress：按 percent 换算 completed = total * percent / 100
+    /// Progress：按 percent 换算 completed = total * percent / 100，并自算瞬时速度
     ///
-    /// KGet 事件只有 percent（0~100）且 speed 恒为 0，无字节数；
-    /// total 为 0（如 https 探测失败）时仅维持速度统计，不写 completed。
+    /// KGet 事件只有 percent（0~100）且 speed 恒为 0，无字节数：
+    /// - `total > 0`：按"进度差值 / 时间差"自算速度（每 100ms 采样一次，未到
+    ///   采样间隔沿用上一次计算值），保证前端速度计 / engine:global-stat 的
+    ///   downloadSpeed 不为 0；
+    /// - `total == 0`（探测失败）：仅维持 completed 不变，不计算速度（保持现状）。
     fn handle_progress(&self, gid: &str, percent: f64, speed: u64) {
         let mut repo = match self.repo.lock() {
             Ok(repo) => repo,
@@ -729,7 +748,46 @@ impl TaskManager {
             // total 未知：不写 completed（保持 0，避免进度虚高）
             task.completed_length
         };
-        let _ = repo.update_progress(gid, completed, total, speed, 0, connections);
+        // 瞬时速度自算（锁顺序：先锁 repo（上文已持有），再锁 speed_samples，
+        // 全程保持该顺序、不反向嵌套，避免死锁）
+        let computed_speed = if total > 0 {
+            let now = std::time::Instant::now();
+            let mut samples = match self.speed_samples.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("[Motrix] Progress 回调获取速度采样锁失败: {e}");
+                    // 锁失败：退化为 KGet 传入值（恒 0）更新进度后返回
+                    let _ = repo.update_progress(gid, completed, total, speed, 0, connections);
+                    return;
+                }
+            };
+            match samples.get_mut(gid) {
+                // 已有快照：达到 100ms 采样间隔才计算并更新，否则沿用上一次速度
+                Some((last_completed, last_at)) => {
+                    let dt_ms = now.duration_since(*last_at).as_millis() as u64;
+                    if dt_ms >= 100 {
+                        // Δcompleted 用 saturating_sub 防御 percent 换算的微小回退
+                        let delta = completed.saturating_sub(*last_completed);
+                        let new_speed = delta * 1000 / dt_ms;
+                        *last_completed = completed;
+                        *last_at = now;
+                        new_speed
+                    } else {
+                        // 未到采样间隔：保留上一次计算出的速度
+                        task.download_speed
+                    }
+                }
+                // 首次见到该 gid：只建立快照不产出速度（首个采样点）
+                None => {
+                    samples.insert(gid.to_string(), (completed, now));
+                    task.download_speed
+                }
+            }
+        } else {
+            // total 未知：不计算速度（保持现状，KGet speed 恒 0）
+            speed
+        };
+        let _ = repo.update_progress(gid, completed, total, computed_speed, 0, connections);
     }
 
     /// Finished：置 Complete + completed=total + 速度归零 + 唤醒下一个等待任务
@@ -747,10 +805,13 @@ impl TaskManager {
             if !matches!(task.status, TaskStatus::Active | TaskStatus::Waiting) {
                 return;
             }
-            let total = task.total_length;
+            // 完成字节数：total>0 直接用 total；total==0（探测失败，如 https 任务）
+            // 时读取磁盘文件大小回填，保证 completedLength/totalLength 不为 0
+            // （进度=100%，见 resolve_finished_bytes）
+            let (completed, total) = resolve_finished_bytes(task);
             let connections = task.connections.max(1);
             // 完成时 completed = total（与 percent 换算结果对齐），下载/上传速度归零
-            let _ = repo.update_progress(gid, total, total, 0, 0, connections);
+            let _ = repo.update_progress(gid, completed, total, 0, 0, connections);
             let _ = repo.set_status(gid, TaskStatus::Complete);
             // Task 11：完成事件（前端 onDownloadComplete 触发完成通知）
             self.emit_event(gid, "complete");
@@ -758,6 +819,10 @@ impl TaskManager {
         // 释放运行集合中的句柄（引擎线程已结束）
         if let Ok(mut active) = self.active.lock() {
             active.remove(gid);
+        }
+        // 清理速度采样快照（repo / active 锁均已释放，独立短锁，避免锁嵌套）
+        if let Ok(mut samples) = self.speed_samples.lock() {
+            samples.remove(gid);
         }
         // 唤醒下一个等待任务（受 max-concurrent 限制）
         self.promote_waiting();
@@ -786,6 +851,10 @@ impl TaskManager {
         if let Ok(mut active) = self.active.lock() {
             active.remove(gid);
         }
+        // 清理速度采样快照（独立短锁，避免与 repo 锁嵌套）
+        if let Ok(mut samples) = self.speed_samples.lock() {
+            samples.remove(gid);
+        }
         // 唤醒下一个等待任务
         self.promote_waiting();
     }
@@ -794,6 +863,26 @@ impl TaskManager {
 // ======================================================================
 // 辅助函数
 // ======================================================================
+
+/// 解析任务完成时的 (completed, total) 字节数（handle_finished 回填用）
+///
+/// - `total_length > 0`：直接返回 `(total, total)`（完成时已下载字节 = 总长）；
+/// - `total_length == 0`（探测失败，如 https 任务）：读取 `files[0].path`
+///   的磁盘文件大小回填（两者相等，进度 = 100%）；文件不存在（异常场景）
+///   返回 `(0, 0)`，避免虚报进度。
+fn resolve_finished_bytes(task: &Task) -> (u64, u64) {
+    if task.total_length > 0 {
+        return (task.total_length, task.total_length);
+    }
+    // total 未知：以磁盘实际文件大小为准（下载完成时文件即完整内容）
+    let size = task
+        .files
+        .first()
+        .and_then(|f| std::fs::metadata(&f.path).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    (size, size)
+}
 
 /// 从 URL 提取保存文件名（`scheme://` 之后路径部分的最后一个 '/' 之后内容），
 /// 无路径（仅 host）或以 '/' 结尾（目录）时回退 "download"
@@ -1229,6 +1318,40 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // 测试：resolve_finished_bytes 完成字节回填（total==0 时读磁盘文件大小）
+    // ------------------------------------------------------------------
+    #[test]
+    fn resolve_finished_bytes_handles_unknown_total() {
+        let temp = TempDir::new();
+
+        // 场景 1：total_length=0，files[0].path 指向已存在的文件 → (文件大小, 文件大小)
+        // （https 探测失败场景：完成后以磁盘实际大小回填 total 与 completed）
+        let done_path = temp.path().join("done.bin");
+        std::fs::write(&done_path, vec![9u8; 42]).expect("写入测试文件失败");
+        let mut task = Task::new_http_task(
+            "a".to_string(),
+            &["http://127.0.0.1:9/file".to_string()],
+            temp.path().to_string_lossy().to_string(),
+            "done.bin",
+        );
+        assert_eq!(task.total_length, 0);
+        assert_eq!(resolve_finished_bytes(&task), (42, 42));
+
+        // 场景 2：total_length > 0 → (total, total)，不读文件
+        task.total_length = 1234;
+        assert_eq!(resolve_finished_bytes(&task), (1234, 1234));
+
+        // 场景 3：total_length=0 且文件不存在（异常场景）→ (0, 0)，不虚报进度
+        let missing = Task::new_http_task(
+            "b".to_string(),
+            &["http://127.0.0.1:9/file".to_string()],
+            temp.path().to_string_lossy().to_string(),
+            "nope.bin",
+        );
+        assert_eq!(resolve_finished_bytes(&missing), (0, 0));
+    }
+
+    // ------------------------------------------------------------------
     // 测试 5：change_global_option 更新并发数并持久化到 system.json
     // ------------------------------------------------------------------
     #[test]
@@ -1348,5 +1471,77 @@ mod tests {
 
         // 下载写回了任务的保存路径且内容与服务器一致
         assert_completed_with_file(&repo, &gid, &content);
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 9：瞬时下载速度自算（Task 4：KGet Progress 事件不带实时速度）
+    // 慢速下载（1MB、每 64KB 块 20ms 延迟 ≈ 320ms 总时长），轮询断言
+    // 下载过程中 download_speed 出现 > 0 的采样值（首个速度样本在 ~100ms
+    // 产生），完成后速度归 0。
+    // ------------------------------------------------------------------
+    #[test]
+    fn progress_reports_computed_download_speed() {
+        // 1MB 内容 + 每块 20ms 发送延迟：总时长约 320ms（16 块 × 20ms），
+        // 期间能产生约 2~3 个速度采样点（每 100ms 一次），速度 > 0 的窗口
+        // 足够轮询捕获；connections=1 走 AdvancedDownloader 单段路径
+        let content = vec![5u8; 1024 * 1024];
+        let server = TestHttpServer::start_with_delay(content.clone(), Duration::from_millis(20));
+        let (tm, repo, _temp) = test_manager(1);
+
+        let gids = tm
+            .add_uri(
+                &[server.url("/file")],
+                &json!({"out": "speed.bin", "connections": 1}),
+            )
+            .expect("add_uri 应成功");
+        let gid = &gids[0];
+
+        // 阶段 1：等待任务开始下载（Active / 已完成均可，且 completedLength > 0，
+        // 即首个 Progress 回调已到达）
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (status, completed) = {
+                let guard = repo.lock().expect("获取任务仓库锁失败");
+                let task = guard.get(gid).expect("任务应存在于仓库");
+                (task.status, task.completed_length)
+            };
+            if completed > 0 && matches!(status, TaskStatus::Active | TaskStatus::Complete) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "任务未在 10s 超时内开始下载（completedLength 一直为 0）"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // 阶段 2：轮询（最长 10s）断言瞬时速度 > 0。首个速度样本在首个
+        // Progress 回调后 ~100ms 产生，下载 ~320ms 完成，速度 > 0 的状态有
+        // 约 200ms 窗口可捕获（50ms 轮询间隔足够稳定命中）
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_speed = false;
+        while Instant::now() < deadline {
+            let speed = repo
+                .lock()
+                .expect("获取任务仓库锁失败")
+                .get(gid)
+                .expect("任务应存在于仓库")
+                .download_speed;
+            if speed > 0 {
+                saw_speed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(saw_speed, "下载过程中应自算出 > 0 的瞬时速度");
+
+        // 阶段 3：任务完成且文件完整，完成后速度归 0（handle_finished 置零
+        // 并清理速度采样快照）
+        assert_completed_with_file(&repo, gid, &content);
+        assert_eq!(
+            repo.lock().unwrap().get(gid).unwrap().download_speed,
+            0,
+            "完成后下载速度应归零"
+        );
     }
 }

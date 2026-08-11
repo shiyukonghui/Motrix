@@ -313,159 +313,118 @@ pub fn spawn_download(
 
 /// 探测 URL 的 Content-Length（仅用于任务元数据 totalLength，非下载算法）
 ///
-/// 用 `std::net::TcpStream` 手写最小 HTTP 探测：
-/// - **仅支持 http://**：https 需要 TLS 握手（本函数不引入 TLS 依赖），
-///   直接返回 `Err`，由调用方 `unwrap_or(0)` 兜底为 0（任务仍可正常下载，
-///   进度由 UI 按 percent 换算）；
-/// - 流程：先发 `HEAD` 请求解析 `Content-Length`；若服务器不支持 HEAD
-///   （405/403/501 等）或未返回 Content-Length，**重新建立连接**发
-///   `Range: bytes=0-0` 的 GET，从 `206` 响应的 `Content-Range: bytes 0-0/{total}`
-///   取总长度（不复用连接：服务器可能已关闭前一连接）；
-/// - 连接 / 读写均设置 5 秒超时，任何网络异常返回 `Err`，绝不阻塞任务添加；
-/// - 非 200/206 响应返回 `Ok(0)`（表示"未知"，不视为错误）。
+/// 基于 reqwest blocking 客户端（与 KGet 下载引擎同一 HTTP 栈、成熟库实现，
+/// **支持 http/https**，符合"禁止造轮子"原则）：
+/// - **线程模型**：在独立 std 线程内运行 blocking 客户端（与 [`spawn_download`]
+///   引擎线程同一模式——reqwest blocking 内部会创建 tokio runtime，在 Tauri
+///   command / JSON-RPC 的 tokio 异步上下文中 drop runtime 会 panic），结果经
+///   `std::sync::mpsc::channel` 回传；
+/// - 外层 `recv_timeout(5s)`：超时返回 `Err`，绝不阻塞任务添加；
+/// - 探测流程：① 先发 `HEAD` 请求，2xx 且响应头含 `Content-Length` 则直接返回；
+///   ② 否则发 `Range: bytes=0-0` 的 GET，从 `206` 响应的
+///   `Content-Range: bytes 0-0/{total}` 解析总长度；③ 其余情况（404 等）返回
+///   `Ok(0)`（表示"未知"，不视为错误）；
+/// - 网络 / 超时 / URL 非法等硬失败返回 `Err`（由调用方 `unwrap_or(0)` 兜底为 0，
+///   任务仍可正常下载，进度由 UI 按 percent 换算）。
 pub fn probe_content_length(url: &str, options: &EngineOptions) -> Result<u64, String> {
-    use std::io::Write;
+    use std::sync::mpsc;
 
-    // 仅支持 http://（https 需要 TLS，直接返回错误由上层兜底为 0）
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
-        format!("probe_content_length 仅支持 http://（{url} 为 https，返回 0）")
-    })?;
-    // 解析 host[:port] 与 path（无 '/' 时 path 为 "/"）
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = match authority.rfind(':') {
-        Some(idx) if authority[idx + 1..].parse::<u16>().is_ok() => {
-            (&authority[..idx], authority[idx + 1..].parse::<u16>().unwrap())
-        }
-        _ => (authority, 80),
-    };
+    // 仅支持 http/https（KGet 的 FTP 等其它协议不做探测，返回错误由上层兜底为 0）
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "probe_content_length 不支持协议（仅 http/https）: {url}"
+        ));
+    }
 
+    // 独立 std 线程内执行探测（见函数文档：规避 tokio 异步上下文 drop runtime panic）
+    let url = url.to_string();
+    // 线程闭包外保留一份 url 副本供外层超时错误消息使用（url 将被 move 进闭包）
+    let url_for_thread = url.clone();
+    let options = options.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        // 外层已超时返回（接收端 drop）时 send 失败，静默忽略
+        let _ = tx.send(probe_content_length_blocking(&url_for_thread, &options));
+    });
+    // 5 秒超时：探测失败不阻塞任务添加
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| format!("探测 {url} 超时（5 秒）"))?
+}
+
+/// 实际探测逻辑（在独立线程内运行；reqwest blocking 客户端，5 秒超时）
+fn probe_content_length_blocking(url: &str, options: &EngineOptions) -> Result<u64, String> {
     // 用户代理：优先 options.user_agent，否则使用默认 UA
     let ua = options
         .user_agent
         .clone()
         .unwrap_or_else(|| crate::config::CHROME_UA.to_string());
 
-    // 第一步：新建连接发 HEAD 请求
-    let mut stream = connect_http(host, port)?;
-    let head = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(head.as_bytes())
-        .map_err(|e| format!("发送 HEAD 请求失败: {e}"))?;
-    let response = read_response_head(&mut stream)?;
-    let status = parse_status_code(&response);
-    let mut length = parse_content_length(&response);
-
-    // 第二步：HEAD 不支持（非 200/206）或未返回 Content-Length →
-    // 重新连接发 Range GET 探测（服务器可能已关闭 HEAD 连接，必须新建连接）
-    if !matches!(status, 200 | 206) || length.is_none() {
-        let mut stream = connect_http(host, port)?;
-        let get = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n"
-        );
-        stream
-            .write_all(get.as_bytes())
-            .map_err(|e| format!("发送 GET 探测请求失败: {e}"))?;
-        let response = read_response_head(&mut stream)?;
-        let status = parse_status_code(&response);
-        if status == 206 {
-            // 206：从 Content-Range: bytes 0-0/{total} 取总长度
-            length = parse_content_range_total(&response).or(length);
-        } else if status == 200 {
-            length = parse_content_length(&response).or(length);
-        } else {
-            // 其它状态（404 等）：未知，返回 0（不阻塞任务）
-            return Ok(0);
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent(ua);
+    // 代理：all-proxy（配合 all-proxy-user / all-proxy-passwd 构造 reqwest::Proxy）
+    if let Some(proxy_url) = options.all_proxy.as_deref() {
+        if !proxy_url.trim().is_empty() {
+            let mut proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|e| format!("构造代理配置失败: {e}"))?;
+            if let (Some(user), Some(pass)) = (&options.all_proxy_user, &options.all_proxy_passwd) {
+                proxy = proxy.basic_auth(user, pass);
+            }
+            builder = builder.proxy(proxy);
         }
     }
-    Ok(length.unwrap_or(0))
-}
+    let client = builder
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
 
-/// 建立到目标主机的 TCP 连接（5 秒连接 / 读写超时；直连，代理场景探活失败返回 Err）
-fn connect_http(host: &str, port: u16) -> Result<std::net::TcpStream, String> {
-    use std::net::{ToSocketAddrs, TcpStream};
-    use std::time::Duration;
-    // connect_timeout 需要 SocketAddr，先经 ToSocketAddrs 解析主机名
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("解析 {host}:{port} 失败: {e}"))?
-        .next()
-        .ok_or_else(|| format!("解析 {host}:{port} 无结果"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    Ok(stream)
-}
-
-/// 读取响应头（直到空行 `\r\n\r\n`，上限 64KB）
-fn read_response_head(stream: &mut std::net::TcpStream) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = stream
-            .read(&mut chunk)
-            .map_err(|e| format!("读取响应失败: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        // 头部结束（HTTP 头与正文以空行分隔）
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        // 防御：头部异常膨胀时放弃
-        if buf.len() > 64 * 1024 {
-            return Err("响应头超过 64KB".to_string());
+    // 第一步：HEAD 请求，2xx 且响应头含 Content-Length 则直接返回。
+    // 显式发送 `Accept-Encoding: identity`：禁止服务器返回压缩响应
+    // （gzip/br），否则 Content-Length/Content-Range 是压缩后大小，
+    // 与 KGet 解压落盘的最终文件大小不一致，导致 totalLength 显示偏小。
+    let head_resp = client
+        .head(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .map_err(|e| format!("HEAD 请求失败: {e}"))?;
+    if head_resp.status().is_success() {
+        if let Some(len) = head_resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+            if let Some(len) = len.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
+                return Ok(len);
+            }
         }
     }
-    Ok(buf)
-}
 
-/// 解析响应状态码（"HTTP/1.1 200 OK" → 200；解析失败返回 0）
-fn parse_status_code(response: &[u8]) -> u16 {
-    let text = String::from_utf8_lossy(response);
-    let line = text.lines().next().unwrap_or("");
-    let mut parts = line.split_whitespace();
-    let _ = parts.next(); // HTTP/1.1
-    parts.next().and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
-/// 解析 Content-Length 头（未找到返回 None）
-fn parse_content_length(response: &[u8]) -> Option<u64> {
-    let text = String::from_utf8_lossy(response);
-    text.lines().find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            value.trim().parse().ok()
-        } else {
-            None
+    // 第二步：HEAD 不支持（非 2xx）或未返回 Content-Length →
+    // 发 Range: bytes=0-0 的 GET 探测（206 时从 Content-Range 解析总长）
+    let range_resp = client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .map_err(|e| format!("GET 探测请求失败: {e}"))?;
+    let status = range_resp.status();
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        // 206：从 Content-Range: bytes 0-0/{total} 取总长度
+        if let Some(range) = range_resp.headers().get(reqwest::header::CONTENT_RANGE) {
+            if let Some(total) = parse_content_range_total_str(range.to_str().unwrap_or("")) {
+                return Ok(total);
+            }
         }
-    })
+    } else if status.is_success() {
+        // 200：从 Content-Length 取总长
+        if let Some(len) = range_resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+            if let Some(len) = len.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
+                return Ok(len);
+            }
+        }
+    }
+    // 其它状态（404 等）：视为"未知"，返回 0（不视为错误，不阻塞任务）
+    Ok(0)
 }
 
-/// 解析 Content-Range 的总长度（"bytes 0-0/12345" → 12345；未找到返回 None）
-fn parse_content_range_total(response: &[u8]) -> Option<u64> {
-    let text = String::from_utf8_lossy(response);
-    text.lines().find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-range:") {
-            // 形如 "bytes 0-0/12345"，取 '/' 之后的总长度
-            let total = value.split('/').nth(1)?.trim();
-            total.parse().ok()
-        } else {
-            None
-        }
-    })
+/// 解析 Content-Range 头字符串的总长度（"bytes 0-0/12345" → 12345；未找到返回 None）
+fn parse_content_range_total_str(value: &str) -> Option<u64> {
+    value.split('/').nth(1)?.trim().parse().ok()
 }
 
 /// 拼接输出路径（dir 与文件名，兼容尾部带不带分隔符，统一用正斜杠）
@@ -624,39 +583,40 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // probe_content_length 的响应解析纯函数：状态码 / Content-Length / Content-Range
-    // （真实 HTTP 探测的集成测试见 engine.rs 的测试模块）
+    // probe_content_length 的网络无关用例（真实 HTTP 探测的集成测试见
+    // engine.rs 的测试模块，本模块仅覆盖协议拒绝 / 畸形 URL / 连接拒绝等
+    // 快速失败路径，不依赖外网）
     // ------------------------------------------------------------------
     #[test]
-    fn parse_status_code_extracts_code() {
-        assert_eq!(parse_status_code(b"HTTP/1.1 200 OK\r\n\r\n"), 200);
-        assert_eq!(parse_status_code(b"HTTP/1.1 206 Partial Content\r\n\r\n"), 206);
-        assert_eq!(parse_status_code(b"HTTP/1.1 404 Not Found\r\n\r\n"), 404);
-        // 畸形响应 → 0
-        assert_eq!(parse_status_code(b"garbage"), 0);
-    }
-
-    #[test]
-    fn parse_content_length_extracts_value() {
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 12345\r\nConnection: close\r\n\r\n";
-        assert_eq!(parse_content_length(resp), Some(12345));
-        // 大小写不敏感 / 缺失返回 None
-        assert_eq!(parse_content_length(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n"), Some(7));
-        assert_eq!(parse_content_length(b"HTTP/1.1 200 OK\r\n\r\n"), None);
-    }
-
-    #[test]
-    fn parse_content_range_total_extracts_total() {
-        let resp = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/12345\r\n\r\n";
-        assert_eq!(parse_content_range_total(resp), Some(12345));
-        // 缺失返回 None
-        assert_eq!(parse_content_range_total(b"HTTP/1.1 200 OK\r\n\r\n"), None);
-    }
-
-    #[test]
-    fn probe_content_length_rejects_https() {
-        // https 需要 TLS，本函数不支持 → 返回 Err（调用方 unwrap_or(0) 兜底）
+    fn probe_content_length_rejects_unsupported_protocol() {
+        // FTP 等非 http/https 协议不支持探测 → 快速返回 Err（不启动线程）
         let opts = EngineOptions::default();
-        assert!(probe_content_length("https://example.com/a.zip", &opts).is_err());
+        assert!(probe_content_length("ftp://example.com/a.zip", &opts).is_err());
+        assert!(probe_content_length("magnet:?xt=urn:btih:1234", &opts).is_err());
+    }
+
+    #[test]
+    fn probe_content_length_invalid_url_is_err() {
+        // 畸形 URL（无 scheme）→ 快速返回 Err
+        let opts = EngineOptions::default();
+        assert!(probe_content_length("not a url", &opts).is_err());
+    }
+
+    #[test]
+    fn probe_content_length_connection_refused_is_err() {
+        // https://127.0.0.1:1/x：端口 1 必然拒绝连接（或 TLS 握手失败），
+        // 属于网络硬失败 → 返回 Err（调用方 unwrap_or(0) 兜底），而非 Ok(0)
+        let opts = EngineOptions::default();
+        assert!(probe_content_length("https://127.0.0.1:1/x", &opts).is_err());
+    }
+
+    #[test]
+    fn parse_content_range_total_str_extracts_total() {
+        // 纯函数：Content-Range: bytes 0-0/{total} 的总长度解析
+        assert_eq!(parse_content_range_total_str("bytes 0-0/12345"), Some(12345));
+        // 前后空白容忍 / 总长未知（*）→ None
+        assert_eq!(parse_content_range_total_str(" bytes 0-0/7 "), Some(7));
+        assert_eq!(parse_content_range_total_str("bytes 0-0/*"), None);
+        assert_eq!(parse_content_range_total_str("garbage"), None);
     }
 }

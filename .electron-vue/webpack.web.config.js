@@ -145,7 +145,16 @@ let webConfig = {
         : false
     }),
     new Webpack.DefinePlugin({
-      'process.env.IS_WEB': 'true'
+      'process.env.IS_WEB': 'true',
+      // Web（Tauri）构建没有 Node 全局 `process`，必须在这里把运行时引用的
+      // `process.env.*` 全部替换为字面量，否则常量模块 / Vue / store 会报
+      // "process is not defined"（详见 src/shared/constants.js 的 PORTABLE_EXECUTABLE_DIR）
+      'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
+      'process.env.PORTABLE_EXECUTABLE_DIR': 'undefined'
+    }),
+    // Web 构建无 Node 全局 Buffer（parse-torrent → bencode 需要），全局注入 polyfill
+    new Webpack.ProvidePlugin({
+      Buffer: ['buffer', 'Buffer']
     }),
     new Webpack.HotModuleReplacementPlugin(),
     new Webpack.NoEmitOnErrorsPlugin(),
@@ -166,6 +175,9 @@ let webConfig = {
     // modules (only used by code paths the UI never reaches, e.g. simple-get).
     fallback: {
       path: path.join(__dirname, '../src/shims/path.js'),
+      // parse-torrent → bencode 依赖 Node 内置 Buffer，webpack 5 不自动 polyfill，
+      // 这里用 `buffer` 包补齐（配合下方 ProvidePlugin 全局注入 Buffer）
+      buffer: require.resolve('buffer/'),
       http: false,
       https: false,
       querystring: false,

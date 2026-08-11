@@ -183,6 +183,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_config,
             commands::save_app_config,
+            // —— 原生 shell 能力（Task 3）：showItemInFolder / openPath / trashItem ——
+            commands::show_item_in_folder,
+            commands::open_path,
+            commands::trash_item,
             // —— 任务操作占位命令（Phase 1，Task 6）——
             commands::add_uri,
             commands::add_torrent,

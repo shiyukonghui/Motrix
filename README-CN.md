@@ -155,6 +155,15 @@ cd Motrix
 yarn
 ```
 
+> 构建 Tauri + Rust 版（`src-tauri` / `crates/*`）需额外前置条件：
+>
+> - Rust 工具链（stable，rustup 安装即可）；
+> - **Windows 必须安装 perl**：Rust 依赖 `KGet`（下载引擎）无条件依赖 `ssh2` → `libssh2-sys` → `openssl-sys`，
+>   在无系统 OpenSSL 时以 `vendored` 方式从源码编译 OpenSSL，该过程需要 perl 环境
+>   （推荐 [Strawberry Perl](https://strawberryperl.com/)；Git for Windows 自带的 MSYS perl
+>   缺少 `Locale::Maketext::Simple` 等模块，无法完成 OpenSSL 配置）；
+> - Windows 构建需要 Visual Studio 的 MSVC 工具链（`cl` / `nmake`，供 vendored OpenSSL 编译使用）。
+
 天朝大陆用户建议使用淘宝的 npm 源
 
 ```bash

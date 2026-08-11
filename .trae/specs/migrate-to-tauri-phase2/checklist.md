@@ -22,12 +22,12 @@
 
 ## Phase 2：HTTP/FTP 下载引擎
 - [x] 任务模型字段与 aria2 `tellStatus` 对齐（数值以字符串输出），16 位 hex gid，状态机正确迁移（契约测试覆盖）
-- [x] KGet 集成：新增 HTTP 任务可实际下载到目标目录，进度/速度字段持续更新（冒烟测试实测：`totalLength`/`completedLength` 正确、文件落盘、status=complete）
+- [x] KGet 集成：新增 HTTP 任务可实际下载到目标目录，进度/速度字段持续更新（冒烟测试实测：`totalLength`/`completedLength` 正确、文件落盘、status=complete；**已在 fix-phase2-issues 修复 https 探测与速度统计**）
 - [x] 任务操作（暂停/恢复/删除含 force、批量）真实作用于 KGet 引擎（engine 集成测试覆盖 pause/resume/remove/并发队列）
 - [x] 断点续传有效：暂停后恢复 / 重启后基于 checkpoint 从已下载字节继续（engine 集成测试 + checkpoint 恢复测试 + files 兜底 URL 修复）
 - [x] 限速与代理配置（`changeGlobalOption` / `changeOption`）生效（全局选项对新任务生效并持久化 system.json；运行中任务即时生效受限——KGet 库限制，已在代码注释与迁移文档风险表中说明）
 - [x] 前端数据管线切换完成：`EngineClient.vue` 无轮询，`Api.js` 操作走 Tauri command、状态走 `engine:*` 事件，任务列表/进度条/速度计流畅更新（grep 确认无轮询/定时器）
 - [x] 会话持久化：旧 `download.session` 可导入重建任务列表；自有 checkpoint 退出保存、启动恢复（session 单元测试 + 启动恢复接线）
 - [x] 契约测试通过：getVersion / getGlobalStat / tellStatus 字段与 Electron 版录制样本一致（contract.rs 6 用例 + jsonrpc.rs 12 用例）
-- [x] 下载集成测试通过：大/小文件、断点、限速场景（`cargo test --workspace` 75 用例全绿）
+- [x] 下载集成测试通过：大/小文件、断点、限速场景（`cargo test --workspace` 80 用例全绿，**fix-phase2-issues 后新增探测/回填/速度用例，无回归**）
 - [x] `tauri dev` 手工验收：新增 HTTP 任务 → 下载/暂停/恢复/删除全流程可用，事件推送流畅、无轮询（冒烟测试：addUri→complete→remove→purge 全流程实测通过）

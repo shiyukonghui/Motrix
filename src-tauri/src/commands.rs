@@ -1,10 +1,12 @@
 //! Tauri commands：前端经 invoke() 调用的命令实现
 //!
-//! 提供两类命令：
+//! 提供三类命令：
 //! - 配置读写（Phase 0）：get_app_config / save_app_config
 //! - 任务操作（Phase 2，Task 10）：add_uri / add_torrent / pause_task / resume_task /
 //!   remove_task / change_option / change_global_option / get_global_stat / get_engine_info /
 //!   get_tasks / get_task_detail / get_peers / save_session / purge
+//! - 原生 shell 能力（Task 3）：show_item_in_folder / open_path / trash_item
+//!   （等价 Electron 版 shell.showItemInFolder / shell.openPath / shell.trashItem）
 //!
 //! 任务操作命令已接入 motrix-core 真实引擎（TaskManager）：添加 / 暂停 / 恢复 / 删除
 //! 均由 KGet 引擎实际执行；add_torrent（BT）与 get_peers 属 Phase 3，返回明确占位。
@@ -260,4 +262,182 @@ pub fn purge(state: State<'_, AppState>) -> Result<String, String> {
     debug!("[Motrix] purge 调用（清空 removed 历史）");
     state.task_manager.purge();
     Ok("OK".to_string())
+}
+
+// ==================== 原生 shell 能力命令（Task 3） ====================
+// 等价 Electron 版 shell.showItemInFolder / openPath / trashItem，
+// 前端 src/shims/remote-shell.js 经 invoke() 调用；平台命令直接用
+// std::process::Command spawn 系统程序（explorer / open / xdg-open），
+// 不引入 tauri-plugin，避免额外权限与依赖。
+
+/// 平台命令动作：定位文件 / 打开文件目录
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellAction {
+    /// 在系统文件管理器中定位并选中文件
+    Reveal,
+    /// 用系统默认程序打开文件 / 目录
+    Open,
+}
+
+/// 构造平台 shell 命令，返回 `[程序名, 参数...]` 列表
+///
+/// - Windows：`explorer /select,<path>`（`/select,` 需与路径拼成单个参数串）；
+///   打开用 `explorer <path>`
+/// - macOS：定位用 `open -R <path>`；打开用 `open <path>`
+/// - Linux：`xdg-open`（打开 / 定位均用它）；Linux 文件管理器没有可靠的标准
+///   "定位文件"命令，故 Reveal 退化为打开文件所在父目录（此限制在注释中说明）
+fn build_shell_command(action: ShellAction, path: &str) -> Vec<String> {
+    match action {
+        ShellAction::Reveal => {
+            #[cfg(target_os = "windows")]
+            {
+                vec!["explorer".to_string(), format!("/select,{path}")]
+            }
+            #[cfg(target_os = "macos")]
+            {
+                vec!["open".to_string(), "-R".to_string(), path.to_string()]
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Linux 无"定位并选中文件"的标准命令，打开父目录作为近似
+                let parent = std::path::Path::new(path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string());
+                vec!["xdg-open".to_string(), parent]
+            }
+        }
+        ShellAction::Open => {
+            #[cfg(target_os = "windows")]
+            {
+                vec!["explorer".to_string(), path.to_string()]
+            }
+            #[cfg(target_os = "macos")]
+            {
+                vec!["open".to_string(), path.to_string()]
+            }
+            #[cfg(target_os = "linux")]
+            {
+                vec!["xdg-open".to_string(), path.to_string()]
+            }
+        }
+    }
+}
+
+/// spawn 平台命令（分离执行，不等待子进程结束），失败返回原因
+fn run_spawned(program: &str, args: &[String]) -> Result<(), String> {
+    std::process::Command::new(program)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("启动 {program} 失败: {e}"))
+}
+
+/// 在系统文件管理器中定位并选中该文件（等价 Electron shell.showItemInFolder）
+///
+/// - Windows：`explorer /select,<path>`；macOS：`open -R <path>`
+/// - Linux：xdg-open 打开文件所在父目录（文件管理器无可靠"定位文件"标准命令）
+#[tauri::command]
+pub fn show_item_in_folder(path: String) -> Result<String, String> {
+    let cmd = build_shell_command(ShellAction::Reveal, &path);
+    // build_shell_command 保证列表非空：首元素为程序名，其余为参数
+    run_spawned(&cmd[0], &cmd[1..])?;
+    Ok("OK".to_string())
+}
+
+/// 用系统默认程序打开文件 / 目录（等价 Electron shell.openPath）
+///
+/// Windows：`explorer <path>`；macOS：`open <path>`；Linux：`xdg-open <path>`
+#[tauri::command]
+pub fn open_path(path: String) -> Result<String, String> {
+    let cmd = build_shell_command(ShellAction::Open, &path);
+    run_spawned(&cmd[0], &cmd[1..])?;
+    Ok("OK".to_string())
+}
+
+/// 将文件 / 目录移到回收站（等价 Electron shell.trashItem）
+///
+/// 使用 `trash` crate 跨平台实现（Windows 回收站 / macOS Trash / Linux trash）。
+/// 失败返回 Err（含原因），成功返回 "OK"。
+#[tauri::command]
+pub fn trash_item(path: String) -> Result<String, String> {
+    trash::delete(&path).map_err(|e| format!("移入回收站失败: {e}"))?;
+    Ok("OK".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// build_shell_command 的平台分支断言：仅编译当前目标平台对应的用例
+    #[test]
+    fn build_shell_command_reveal() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            build_shell_command(ShellAction::Reveal, r"C:\Users\test\file.txt"),
+            vec![
+                "explorer".to_string(),
+                r"/select,C:\Users\test\file.txt".to_string()
+            ]
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            build_shell_command(ShellAction::Reveal, "/tmp/file.txt"),
+            vec![
+                "open".to_string(),
+                "-R".to_string(),
+                "/tmp/file.txt".to_string()
+            ]
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            build_shell_command(ShellAction::Reveal, "/tmp/file.txt"),
+            vec!["xdg-open".to_string(), "/tmp".to_string()]
+        );
+    }
+
+    /// build_shell_command 打开分支断言：仅编译当前目标平台对应的用例
+    #[test]
+    fn build_shell_command_open() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            build_shell_command(ShellAction::Open, r"C:\Users\test\file.txt"),
+            vec!["explorer".to_string(), r"C:\Users\test\file.txt".to_string()]
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            build_shell_command(ShellAction::Open, "/tmp/file.txt"),
+            vec!["open".to_string(), "/tmp/file.txt".to_string()]
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            build_shell_command(ShellAction::Open, "/tmp/file.txt"),
+            vec!["xdg-open".to_string(), "/tmp/file.txt".to_string()]
+        );
+    }
+
+    /// trash_item 往返测试：临时文件被移入回收站后原路径不再存在
+    ///
+    /// 注意：回收站操作依赖系统桌面环境，CI / 无桌面沙箱可能受限；
+    /// 若环境不支持可将本测试标注 #[ignore] 跳过（本机 Windows 应可跑通）。
+    #[test]
+    fn trash_item_moves_file_to_trash() {
+        // 用"进程 id + 纳秒时间戳"拼唯一临时文件名，避免并发测试冲突
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX 纪元")
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("motrix_trash_test_{}_{}.tmp", std::process::id(), nanos));
+
+        std::fs::write(&path, b"trash test payload").expect("写临时文件失败");
+        assert!(path.exists(), "临时文件应已创建");
+
+        let result = trash_item(path.to_string_lossy().to_string());
+        assert!(result.is_ok(), "trash_item 应成功，实际: {:?}", result);
+        assert!(
+            !path.exists(),
+            "文件移入回收站后原路径不应再存在（已移入回收站）"
+        );
+    }
 }

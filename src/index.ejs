@@ -3,8 +3,9 @@
   <head>
     <meta charset="utf-8">
     <title>Motrix</title>
-    <% if (htmlWebpackPlugin.options.nodeModules) { %>
+    <% if (htmlWebpackPlugin.options.nodeModules && !htmlWebpackPlugin.options.isBrowser) { %>
       <!-- Add `node_modules/` to global paths so `require` works properly in development -->
+      <!-- Web 构建（Tauri）无 Node `require`，跳过该注入，避免运行时 ReferenceError -->
       <script>
         require('module').globalPaths.push('<%= htmlWebpackPlugin.options.nodeModules.replace(/\\/g, '\\\\') %>')
       </script>
