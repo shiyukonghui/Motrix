@@ -19,10 +19,11 @@ const NUMERIC_FIELDS = [
   'numSeeders'
 ]
 
-// 视图 → 允许的任务状态集合（与 Api.js fetchTaskList 的 status 分组语义一致）
+// 视图 → 允许的任务状态集合（与 Api.js fetchTaskList 的 status 分组语义一致；
+// waiting 视图含 paused——aria2 tellWaiting 语义，暂停任务仍在等待队列）
 const TASK_VIEW_STATUS = {
   active: ['active', 'waiting'],
-  waiting: ['waiting'],
+  waiting: ['waiting', 'paused'],
   stopped: ['complete', 'error', 'removed']
 }
 

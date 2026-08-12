@@ -185,7 +185,11 @@ export default class Api {
     const { offset = 0, num = 20 } = params
     return this.fetchAllTasks()
       .then((tasks) => {
-        const filtered = tasks.filter((task) => task.status === 'waiting')
+        // 等待中视图 = waiting + paused（与 aria2 tellWaiting 语义一致：
+        // 暂停的任务仍处于等待队列，可在等待中页恢复）
+        const filtered = tasks.filter((task) => {
+          return task.status === 'waiting' || task.status === 'paused'
+        })
         return this.sliceTaskList(filtered, offset, num)
       })
   }

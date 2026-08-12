@@ -151,13 +151,24 @@ impl RpcBackend for CoreRpcBackend {
                 Ok(json!(tasks))
             }
             // tellWaiting / tellStopped：支持 offset / num 分页
+            // aria2 语义：tellWaiting 返回"等待队列"，**包含已暂停任务**（暂停的任务
+            // 仍处于等待队列，可随时恢复）；故按 waiting + paused 过滤，与前端
+            // fetchWaitingTaskList（等待中页）一致。
             "aria2.tellWaiting" => {
                 let repo = self
                     .task_manager
                     .repo
                     .lock()
                     .map_err(|e| RpcError::Internal(format!("获取任务仓库锁失败: {e}")))?;
-                Ok(paginate_tasks(&repo.waiting(), params))
+                let waiting: Vec<Task> = repo
+                    .all()
+                    .iter()
+                    .filter(|t| {
+                        matches!(t.status, TaskStatus::Waiting | TaskStatus::Paused)
+                    })
+                    .cloned()
+                    .collect();
+                Ok(paginate_tasks(&waiting, params))
             }
             "aria2.tellStopped" => {
                 let repo = self

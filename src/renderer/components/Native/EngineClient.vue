@@ -65,6 +65,9 @@
       },
       // Task 11：engine:task-event 事件分发（{ gid, event } → 对应通知处理方法）。
       // event 取值 start/stop/pause/complete/error/bt-complete，与原 aria2 通知语义一致。
+      // 注意：`pause` 事件**刻意不弹提示**——原始 Electron 版同样取消了 pause 通知
+      // 的绑定（`api.client.on('onDownloadPause', ...)` 被注释），暂停 toast 由
+      // 点击处的 handlePauseTask 弹一次；若此处再弹会与点击提示重复（双弹）。
       dispatchTaskEvent ({ gid, event }) {
         // 兼容原处理方法的签名（接收 [{ gid }] 数组）
         const payload = [{ gid }]
@@ -73,7 +76,7 @@
           this.onDownloadStart(payload)
           break
         case 'pause':
-          this.onDownloadPause(payload)
+          // 暂停状态仍会经 engine:snapshot → MERGE_TASKS 更新列表，仅不弹 toast
           break
         case 'stop':
           this.onDownloadStop(payload)
@@ -110,23 +113,6 @@
             this.$store.dispatch('preference/recordHistoryDirectory', dir)
             const taskName = getTaskName(task)
             const message = this.$t('task.download-start-message', { taskName })
-            this.$msg.info(message)
-          })
-      },
-      onDownloadPause (event) {
-        const [{ gid }] = event
-        const { seedingList } = this
-        if (seedingList.includes(gid)) {
-          return
-        }
-
-        this.fetchTaskItem({ gid })
-          .then((task) => {
-            if (!task) {
-              return
-            }
-            const taskName = getTaskName(task)
-            const message = this.$t('task.download-pause-message', { taskName })
             this.$msg.info(message)
           })
       },
@@ -245,8 +231,9 @@
     },
     created () {
       // Task 11：订阅 engine:task-event（Rust 端经 TaskManager 事件通道转发），
-      // 分发到 onDownloadStart / onDownloadPause / onDownloadStop / onDownloadComplete /
-      // onDownloadError / onBtDownloadComplete 等通知处理方法（替代原 aria2 WS 通知绑定）
+      // 分发到 onDownloadStart / onDownloadStop / onDownloadComplete /
+      // onDownloadError / onBtDownloadComplete 等通知处理方法（替代原 aria2 WS 通知绑定；
+      // pause 事件刻意不弹提示，见 dispatchTaskEvent 注释）
       this.unlistenTaskEvent = onTaskEvent((data) => {
         this.dispatchTaskEvent(data)
       })

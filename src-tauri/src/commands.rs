@@ -46,11 +46,23 @@ pub fn get_app_config(state: State<'_, AppState>) -> Result<Value, String> {
         "user-data-path": data_dir.to_string_lossy().to_string(),
     });
 
-    Ok(json!({
-        "user": user,
-        "system": system,
-        "context": context,
-    }))
+    // 返回**扁平合并对象**（与 Electron 版 get-app-config 一致：`{...system, ...user, ...context}`）：
+    // 前端 Api.js::loadConfig 对结果做 changeKeysToCamelCase 后整体作为 preference.config，
+    // 视觉组件直接读取顶层键（如 config.locale / config.theme / config.maxConcurrentDownloads）。
+    // 若按 user/system/context 三层嵌套返回，config.locale 等顶层键将缺失，
+    // 导致设置页等组件 data() 抛 "Cannot read properties of undefined (reading 'startsWith')"。
+    let mut merged = serde_json::Map::new();
+    // 合并顺序与 Electron 一致：system 为底 → user 覆盖 → context 覆盖（同键后者胜）
+    for (k, v) in system.as_object().into_iter().flatten() {
+        merged.insert(k.clone(), v.clone());
+    }
+    for (k, v) in user.as_object().into_iter().flatten() {
+        merged.insert(k.clone(), v.clone());
+    }
+    for (k, v) in context.as_object().into_iter().flatten() {
+        merged.insert(k.clone(), v.clone());
+    }
+    Ok(Value::Object(merged))
 }
 
 /// 保存应用配置：payload 形如 `{ "user": {...}, "system": {...} }`，分区写回对应 JSON 文件

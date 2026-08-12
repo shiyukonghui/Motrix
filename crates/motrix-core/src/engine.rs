@@ -33,6 +33,8 @@ use tracing::warn;
 
 use crate::bt::{BtAddOptions, BtEngine, BtEngineConfig, BtEvent, BtProgress, TorrentMeta};
 use crate::config::{ConfigManager, SystemConfig};
+use crate::fastdown::FastDownHandle;
+use crate::http::HttpDownloadHandle;
 use crate::kget::{self, KgetEvent, KgetHandle};
 use crate::options::{parse_size, EngineOptions};
 use crate::task::{generate_gid, GlobalStat, Task, TaskFile, TaskRepository, TaskStatus};
@@ -54,6 +56,42 @@ pub struct TaskEvent {
     pub event: String,
 }
 
+/// 下载引擎句柄（统一并行 HTTP / 顺序 HTTP / KGet 三种实现）
+///
+/// - [`FastDownHandle`]：HTTP(S) 并行下载（fastdown.rs，fast-down 5.0.2，
+///   多连接 + 侧车状态字节级续传，首选）；
+/// - [`HttpDownloadHandle`]：HTTP(S) 顺序下载（http.rs，可靠续传，fast-down
+///   初始化失败 / 代理认证等场景的回退）；
+/// - [`KgetHandle`]：KGet 引擎（非 HTTP 协议 / 既有路径）。
+enum EngineHandle {
+    /// 并行 HTTP 下载（fastdown.rs，首选）
+    FastDown(FastDownHandle),
+    /// 顺序 HTTP 下载（http.rs，回退）
+    Http(HttpDownloadHandle),
+    /// KGet 引擎（kget.rs）
+    Kget(KgetHandle),
+}
+
+impl EngineHandle {
+    /// 中止下载（暂停 / 删除用）
+    fn abort(&self) {
+        match self {
+            EngineHandle::FastDown(h) => h.abort(),
+            EngineHandle::Http(h) => h.abort(),
+            EngineHandle::Kget(h) => h.abort(),
+        }
+    }
+
+    /// 有限等待引擎线程退出
+    fn wait_exit(&self, timeout: std::time::Duration) -> bool {
+        match self {
+            EngineHandle::FastDown(h) => h.wait_exit(timeout),
+            EngineHandle::Http(h) => h.wait_exit(timeout),
+            EngineHandle::Kget(h) => h.wait_exit(timeout),
+        }
+    }
+}
+
 /// 任务管理器（任务编排胶水层）
 pub struct TaskManager {
     /// 任务仓库（与 Tauri AppState / 广播循环 / JSON-RPC 共享同一份）
@@ -64,7 +102,7 @@ pub struct TaskManager {
     /// 新任务以此为基础克隆后叠加任务级 options）
     global: Mutex<EngineOptions>,
     /// 运行中任务 gid -> 引擎句柄（暂停 / 删除时 abort；任务结束/失败时移除）
-    active: Mutex<HashMap<String, KgetHandle>>,
+    active: Mutex<HashMap<String, EngineHandle>>,
     /// gid -> 源 URL 列表（恢复 / 重试用，spawn 时取 uris[0] 发起下载）
     task_uris: Mutex<HashMap<String, Vec<String>>>,
     /// gid -> 任务级引擎选项（change_option 更新，spawn 时使用）
@@ -165,14 +203,17 @@ impl TaskManager {
     // 任务操作（公开 API，供 Tauri commands / JSON-RPC 后端调用）
     // ==================================================================
 
-    /// 添加 HTTP/FTP URL 任务（aria2.addUri 语义）
+    /// 添加 URL 任务（aria2.addUri 语义）
     ///
     /// 每个 URL 创建一个独立任务并返回对应 gid 列表：
     /// 1. 以全局选项为基准克隆 + 叠加任务级 `options`（dir/out 取任务级或全局）；
-    /// 2. HTTP(S) URL 尽力探测 Content-Length 填充 `total_length`
+    /// 2. **magnet 链接按 aria2 语义（addUri 接受 magnet:）路由到 BT 引擎**
+    ///    （经 [`TaskManager::add_torrent`]，前端 AddTask 对话框的 URI 标签页
+    ///    会把磁力链接走 addUri 通道，若按 HTTP 处理会报 builder error）；
+    /// 3. HTTP(S) URL 尽力探测 Content-Length 填充 `total_length`
     ///    （探测失败返回 0，不阻塞任务，进度由 UI 按 percent 换算）；
-    /// 3. 加入任务仓库并记录 task_uris / task_options；
-    /// 4. 若当前运行数 < max-concurrent-downloads 则置 Active 并启动引擎，
+    /// 4. 加入任务仓库并记录 task_uris / task_options；
+    /// 5. 若当前运行数 < max-concurrent-downloads 则置 Active 并启动引擎，
     ///    否则保持 Waiting 入队（完成任务 / 失败后自动 promote）。
     pub fn add_uri(&self, uris: &[String], options: &Value) -> Result<Vec<String>, String> {
         if uris.is_empty() {
@@ -188,6 +229,11 @@ impl TaskManager {
         for uri in uris {
             let uri = uri.trim();
             if uri.is_empty() {
+                continue;
+            }
+            // magnet: 链接 → BT 引擎（librqbit），返回单 gid；与 aria2 行为一致
+            if uri.starts_with("magnet:") {
+                gids.push(self.add_torrent(uri, options)?);
                 continue;
             }
             // 任务级引擎选项：全局 + 任务级覆盖
@@ -260,9 +306,11 @@ impl TaskManager {
     ///   终止走 remove，与 aria2 语义一致）。
     fn pause_bt(&self, gid: &str) -> Result<String, String> {
         // 1. 停止引擎（仅当任务已登记进 librqbit Session；checkpoint 恢复后未
-        //    resume 的任务不在引擎中，跳过引擎操作直接状态迁移）
+        //    resume 的任务不在引擎中，跳过引擎操作直接状态迁移）。
+        //    磁力 metadata 解析中（未登记进 torrents）的任务：取消后台重试循环
         if let Ok(guard) = self.bt.lock() {
             if let Some(engine) = guard.as_ref() {
+                engine.cancel_pending_add(gid);
                 if engine.contains(gid) {
                     engine.pause(gid)?;
                 }
@@ -313,9 +361,9 @@ impl TaskManager {
         if is_bt {
             return self.pause_bt(gid);
         }
-        // 1. abort 并"有限等待"引擎线程退出（KGet 引擎可能阻塞在网络读取，
-        //    不能无限 join（reqwest 内部超时 300s）；超时后直接继续，
-        //    引擎线程稍后自行退出，迟到的 Finished/Failed 事件因状态已变会被忽略）
+        // 1. abort 并"有限等待"引擎线程退出（引擎可能阻塞在网络读取，不能无限
+        //    join；超时后直接继续，引擎线程稍后自行退出，迟到的 Finished/Failed
+        //    事件因状态已变会被忽略）
         if let Some(handle) = self
             .active
             .lock()
@@ -324,10 +372,20 @@ impl TaskManager {
         {
             handle.abort();
             let _ = handle.wait_exit(std::time::Duration::from_millis(2000));
+            // 2. 暂停后部分文件处理（按引擎类型）：
+            //    - FastDown（并行 HTTP，fastdown.rs）：引擎线程在退出前已自行
+            //      **截断文件到最大已写端点 + 持久化 clean 侧车状态**（恢复时
+            //      据此 invert 剩余区间字节级续传），此处无需额外处理；
+            //    - Http（顺序 HTTP，http.rs）：文件即已下载的连续前缀，截断到
+            //      已完成字节（truncate_partial_file），恢复时经 Range 续传追加；
+            //    - Kget（并行非 HTTP / 旧路径）：沿用原"删除预分配假文件"兜底
+            //      （见 cleanup_partial_file 注释），避免恢复误判完成。
+            match &handle {
+                EngineHandle::FastDown(_) => {}
+                EngineHandle::Http(_) => self.truncate_partial_file(gid),
+                EngineHandle::Kget(_) => self.cleanup_partial_file(gid),
+            }
         }
-        // 2. 清理 KGet 预分配可能留下的"假文件"（见 cleanup_partial_file 注释），
-        //    保证恢复时不会误判为已下载完成
-        self.cleanup_partial_file(gid);
         // 2.5 清理速度采样快照（引擎已停止，暂停期间速度无意义；独立短锁，
         //    恢复时从头重新采样）
         if let Ok(mut samples) = self.speed_samples.lock() {
@@ -401,6 +459,38 @@ impl TaskManager {
             if std::fs::remove_file(&path).is_ok() {
                 warn!("[Motrix] 清理 KGet 预分配残留文件（暂停后恢复将重新下载）: {path}");
             }
+        }
+    }
+
+    /// 暂停时把部分文件截断到已完成字节（顺序 HTTP 下载专用）
+    ///
+    /// http.rs 顺序引擎保证文件 = 已下载的**连续前缀**（单连接从 0 顺序写，
+    /// 不预分配整文件），因此截断到 `completed_length` 是安全的：恢复时经
+    /// `Range: bytes={completed}-` 追加续传，不再从头重下（对比 KGet 并行
+    /// 下载因预分配/空洞只能"删文件重下"，见 [`Self::cleanup_partial_file`]）。
+    fn truncate_partial_file(&self, gid: &str) {
+        // 读取任务信息（克隆，避免持锁调用文件系统）
+        let (path, completed) = {
+            let repo = match self.repo.lock() {
+                Ok(repo) => repo,
+                Err(_) => return,
+            };
+            let Some(task) = repo.get(gid) else { return };
+            let path = task
+                .files
+                .first()
+                .map(|f| f.path.clone())
+                .unwrap_or_default();
+            (path, task.completed_length)
+        };
+        // 无进度 / 路径为空：无需处理（恢复从头下载）
+        if path.is_empty() || completed == 0 {
+            return;
+        }
+        if let Err(e) = crate::http::truncate_to(&path, completed) {
+            // Windows 下引擎线程可能仍持有文件句柄；失败仅告警，
+            // 恢复时若文件大小仍 > completed，顺序引擎会从头（Range 被忽略）重下
+            warn!("[Motrix] 暂停截断部分文件失败（恢复将从头下载）: {path}: {e}");
         }
     }
 
@@ -515,12 +605,9 @@ impl TaskManager {
             repo.set_status(gid, TaskStatus::Active)
                 .map_err(|_| format!("任务不存在: {gid}"))?;
         }
-        let engine = self
-            .bt
-            .lock()
-            .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?
-            .clone()
-            .ok_or_else(|| "BT 引擎未初始化".to_string())?;
+        // 获取（必要时懒创建）BT 引擎：重启后恢复的 BT 任务 resume 时引擎
+        // 可能尚未初始化（bt_engine_for 内部按任务级选项懒创建）
+        let engine = self.bt_engine_for(gid)?;
         // checkpoint 恢复的任务：重新加入引擎（已登记则 no-op）；
         // 重新加入的任务在 librqbit 中已自动运行（live），对 live torrent 调
         // unpause 会报错（librqbit "already live"），故仅在"暂停后恢复"场景 unpause。
@@ -562,6 +649,18 @@ impl TaskManager {
             handle.abort();
             let _ = handle.wait_exit(std::time::Duration::from_millis(2000));
         }
+        // 1.5 删除 fast-down 侧车状态文件（任务已移除，断点续传状态失去意义；
+        //     引擎线程在退出前可能已写 clean 状态，需在 wait_exit 后删除。
+        //     路径 = 输出文件 + ".fd.json"）
+        if let Some(path) = self
+            .repo
+            .lock()
+            .ok()
+            .and_then(|repo| repo.get(gid).cloned())
+            .and_then(|t| t.files.first().map(|f| f.path.clone()))
+        {
+            let _ = std::fs::remove_file(crate::fastdown::state_path(&path));
+        }
         // 2. 清理任务级记录
         self.task_uris
             .lock()
@@ -601,6 +700,8 @@ impl TaskManager {
         // 1. 从引擎移除（仅当已登记；checkpoint 恢复后未 resume 的任务跳过）
         if let Ok(guard) = self.bt.lock() {
             if let Some(engine) = guard.as_ref() {
+                // 磁力 metadata 解析中（未登记进 torrents）的任务：取消后台重试循环
+                engine.cancel_pending_add(gid);
                 if engine.contains(gid) {
                     engine.remove(gid)?;
                 }
@@ -844,21 +945,57 @@ impl TaskManager {
         // listen-port 起始的 100 端口范围（避免多实例 / 并行测试端口冲突）
         let config = BtEngineConfig {
             listen_port_range: opts.bt_listen_port.map(|p| p..p.saturating_add(100)),
+            // 禁用 DHT 持久化（迁移文档 7.1：librqbit 路由表重建可接受）：
+            // 避免共享 dht.dat 复用端口导致 GUI/daemon 多实例或测试并行时的绑定冲突
+            disable_dht_persistence: true,
         };
         let engine = BtEngine::new(config, opts.dir.clone())?;
         *guard = Some(engine.clone());
         Ok(engine)
     }
 
+    /// 获取 BT 引擎；未初始化时按任务级选项懒创建
+    ///
+    /// 场景：应用重启后 checkpoint 恢复的 BT 任务 resume / promote 时，引擎
+    /// （懒初始化）可能尚未建立（此前没有新的 add_torrent 调用），若直接取
+    /// `self.bt` 会得到 None 而报"BT 引擎未初始化"，导致恢复的任务无法续传。
+    fn bt_engine_for(&self, gid: &str) -> Result<Arc<BtEngine>, String> {
+        // 已初始化：直接复用（短锁，命中即返回）
+        {
+            let guard = self
+                .bt
+                .lock()
+                .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?;
+            if let Some(engine) = guard.as_ref() {
+                return Ok(engine.clone());
+            }
+        }
+        // 未初始化：用任务级选项（缺省全局选项）创建；bt_engine 内部持锁创建，
+        // 此处先释放上面的锁避免死锁
+        let opts = self
+            .task_options
+            .lock()
+            .map_err(|e| format!("获取任务选项锁失败: {e}"))?
+            .get(gid)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.global
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|e| {
+                        warn!("[Motrix] 懒创建 BT 引擎获取全局选项锁失败，使用默认选项: {e}");
+                        EngineOptions::default()
+                    })
+            });
+        self.bt_engine(&opts)
+    }
+
     /// 确保 BT 任务已登记进引擎（checkpoint 恢复的任务在重启后未加入 librqbit
     /// Session，resume / promote 时据此从 `files[0].uris[0]` 的源重新加入续传）
     fn ensure_bt_registered(&self, gid: &str) -> Result<(), String> {
-        let engine = self
-            .bt
-            .lock()
-            .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?
-            .clone()
-            .ok_or_else(|| "BT 引擎未初始化".to_string())?;
+        // 获取（必要时懒创建）BT 引擎：重启后恢复的 BT 任务首次 resume /
+        // promote 时引擎可能尚未初始化（bt_engine_for 内部处理）
+        let engine = self.bt_engine_for(gid)?;
         if engine.contains(gid) {
             return Ok(());
         }
@@ -1327,8 +1464,46 @@ impl TaskManager {
         let on_event = move |gid: &str, event: KgetEvent| {
             this.on_engine_event(gid, event);
         };
-        let handle = kget::spawn_download(gid.to_string(), &url, &options, on_event)
-            .map_err(|e| format!("启动下载失败: {e}"))?;
+        // HTTP(S) 首选 fast-down 并行引擎（fastdown.rs）：多连接 + 侧车状态
+        // 字节级续传（暂停/恢复不再从头）。初始化失败（代理认证不支持 / 输出
+        // 目录不可写等）回退顺序引擎（http.rs）——已有字节（暂停 / checkpoint
+        // 恢复后的 completed_length）经 Range 续传追加写；非 HTTP（FTP/WebDAV/
+        // Metalink 等）走 KGet（既有路径）。
+        let handle = if url.starts_with("http://") || url.starts_with("https://") {
+            match crate::fastdown::spawn_fast_down_download(
+                gid.to_string(),
+                &url,
+                &options,
+                on_event.clone(),
+            ) {
+                Ok(h) => EngineHandle::FastDown(h),
+                Err(e) => {
+                    warn!("[Motrix] fast-down 启动失败，回退顺序引擎: {e}");
+                    // 已有字节：取任务已完成长度（顺序下载时文件即连续前缀，暂停已截断）
+                    let existing = self
+                        .repo
+                        .lock()
+                        .ok()
+                        .and_then(|repo| repo.get(gid).map(|t| t.completed_length))
+                        .unwrap_or(0);
+                    EngineHandle::Http(
+                        crate::http::spawn_http_download(
+                            gid.to_string(),
+                            &url,
+                            &options,
+                            existing,
+                            on_event,
+                        )
+                        .map_err(|e| format!("启动下载失败: {e}"))?,
+                    )
+                }
+            }
+        } else {
+            EngineHandle::Kget(
+                kget::spawn_download(gid.to_string(), &url, &options, on_event)
+                    .map_err(|e| format!("启动下载失败: {e}"))?,
+            )
+        };
         // 3. 登记运行句柄
         self.active
             .lock()
@@ -1708,6 +1883,10 @@ mod tests {
     // 测试基础设施：极简本地 HTTP 服务器 + 临时目录 + 等待辅助
     // ------------------------------------------------------------------
 
+    // BT 测试串行锁：定义与说明见 crate::bt::BT_TEST_LOCK（bt.rs 与 engine.rs
+    // 的 BT 会话测试共用同一把锁，避免 librqbit DHT 端口并行冲突）
+    use crate::bt::BT_TEST_LOCK;
+
     /// 测试临时目录（Drop 时整体清理）
     struct TempDir(PathBuf);
 
@@ -1850,16 +2029,32 @@ mod tests {
             );
             body = &[];
         } else if let Some(range) = range {
-            // 解析 Range: bytes=start- 或 bytes=start-end（仅取 start）
-            let start: u64 = range
+            // 解析 Range: bytes=start-end（闭区间）或 bytes=start-（省略 end = 文件末尾）；
+            // **必须按请求区间精确返回**：fast-down 的 Range 探测发 `bytes=0-0` 并要求
+            // Content-Range 以 `bytes 0-0/` 开头，若像旧实现那样返回整个尾部会导致
+            // fast-down 误判服务器不支持 Range（走单连接 + 不可续传路径）。
+            let spec = range
                 .split("bytes=")
                 .nth(1)
-                .and_then(|r| r.split('-').next())
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0)
-                .min(total);
-            body = &content[start as usize..];
-            let end = total.saturating_sub(1);
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let (s, e) = match spec.split_once('-') {
+                Some((s, e)) => (s.trim().to_string(), e.trim().to_string()),
+                None => (spec.clone(), String::new()),
+            };
+            let last = total.saturating_sub(1);
+            let start: u64 = s.parse().unwrap_or(0).min(last);
+            let end: u64 = if e.is_empty() {
+                last
+            } else {
+                e.parse().unwrap_or(last).min(last)
+            };
+            if start <= end {
+                body = &content[start as usize..=end as usize];
+            } else {
+                body = &[];
+            }
             head = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -1965,13 +2160,14 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 测试 2：暂停后 abort，恢复后继续（Range 续传）直至完成
+    // 测试 2：暂停后 abort，恢复后从断点继续（http.rs 顺序引擎 Range 续传）直至完成
     // ------------------------------------------------------------------
     #[test]
     fn pause_resume_resumes_to_complete() {
-        // 2MB 内容 + 每块 2ms 发送延迟：保证下载过程可被暂停打断
-        let content = vec![7u8; 2 * 1024 * 1024];
-        let server = TestHttpServer::start_with_delay(content.clone(), Duration::from_millis(2));
+        // 8MB 内容 + 每块 4ms 发送延迟（总时长约 512ms）：保证下载过程可被暂停
+        // 打断（2MB/2ms 下顺序引擎完成太快，pause 可能追不上 → 状态已 Complete）
+        let content = vec![7u8; 8 * 1024 * 1024];
+        let server = TestHttpServer::start_with_delay(content.clone(), Duration::from_millis(4));
         let (tm, repo, _temp) = test_manager(1);
 
         let gids = tm
@@ -1983,8 +2179,26 @@ mod tests {
         let gid = &gids[0];
         // 等待下载开始
         assert!(wait_status(&repo, gid, TaskStatus::Active));
+        // 等待出现实际进度（顺序引擎启动极快，Active 可能早于首个进度事件；
+        // 确保暂停发生在下载中段，验证"暂停保留进度 + 截断 + 续传"）
+        {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let completed = repo
+                    .lock()
+                    .unwrap()
+                    .get(gid)
+                    .map(|t| t.completed_length)
+                    .unwrap_or(0);
+                if completed > 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "下载应在 10s 内产生进度");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
 
-        // 暂停：abort 引擎句柄 + 置 Paused
+        // 暂停：abort 引擎句柄 + 置 Paused + 把部分文件截断到已完成字节
         tm.pause(gid).expect("暂停应成功");
         assert_eq!(
             repo.lock().unwrap().get(gid).unwrap().status,
@@ -1993,12 +2207,106 @@ mod tests {
         // 已暂停任务再次暂停：幂等
         tm.pause(gid).expect("重复暂停应幂等");
 
-        // 恢复：置 Active 并重新 spawn（KGet 检测已有部分文件，Range 续传）
+        // 暂停后应保留了部分进度（顺序引擎真实续传的基础：completed > 0，
+        // 且磁盘文件被截断到 completed，恢复时 Range 续传而非从头重下）
+        let paused = repo.lock().unwrap().get(gid).unwrap().clone();
+        assert!(
+            paused.completed_length > 0 && paused.completed_length < content.len() as u64,
+            "暂停时应保留部分进度，实际 completed={}",
+            paused.completed_length
+        );
+        let disk_size = std::fs::metadata(&paused.files[0].path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            disk_size, paused.completed_length,
+            "暂停后部分文件应被截断到已完成字节（供恢复续传）"
+        );
+
+        // 恢复：置 Active 并重新 spawn（顺序引擎基于已有字节 Range 续传）
         tm.resume(gid).expect("恢复应成功");
         assert!(wait_status(&repo, gid, TaskStatus::Complete));
 
         // 文件完整（续传未损坏内容）
         assert_completed_with_file(&repo, gid, &content);
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 2b：并行下载（connections=4）暂停 → 恢复 → 字节级续传直至完成
+    // fast-down 并行分块 + 侧车状态（*.fd.json）：暂停后文件截断到最大已写端点、
+    // 侧车记录已完成区间（clean=true）；恢复时校验 FileId 后 invert 求剩余区间
+    // 并行续传，最终文件完整（本测试覆盖"并行 + 精确恢复"的核心价值路径）。
+    // ------------------------------------------------------------------
+    #[test]
+    fn parallel_pause_resume_resumes_to_complete() {
+        // 8MB + 每块 20ms 发送延迟：4 连接并行下总时长约 8MB/(4×3.2MB/s)≈625ms，
+        // 可被暂停稳定打断（对比测试 2 的单连接顺序路径）
+        let content = vec![11u8; 8 * 1024 * 1024];
+        let server = TestHttpServer::start_with_delay(content.clone(), Duration::from_millis(20));
+        let (tm, repo, _temp) = test_manager(1);
+
+        let gids = tm
+            .add_uri(
+                &[server.url("/file")],
+                &json!({"out": "pp.bin", "connections": 4}),
+            )
+            .expect("add_uri 应成功");
+        let gid = &gids[0];
+        // 等待下载开始
+        assert!(wait_status(&repo, gid, TaskStatus::Active));
+        // 等待出现实际进度
+        {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let completed = repo
+                    .lock()
+                    .unwrap()
+                    .get(gid)
+                    .map(|t| t.completed_length)
+                    .unwrap_or(0);
+                if completed > 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "下载应在 10s 内产生进度");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // 暂停：置 Paused；fast-down 引擎线程退出前已截断文件 + 持久化 clean 侧车
+        tm.pause(gid).expect("暂停应成功");
+        assert_eq!(
+            repo.lock().unwrap().get(gid).unwrap().status,
+            TaskStatus::Paused
+        );
+        let paused = repo.lock().unwrap().get(gid).unwrap().clone();
+        assert!(
+            paused.completed_length > 0 && paused.completed_length < content.len() as u64,
+            "暂停时应保留部分进度，实际 completed={}",
+            paused.completed_length
+        );
+        // 侧车状态文件已写入且标记 clean（恢复的唯一权威依据）
+        let sidecar = format!("{}.fd.json", paused.files[0].path);
+        assert!(Path::new(&sidecar).exists(), "暂停后应写入侧车状态文件");
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap())
+                .expect("侧车状态应为合法 JSON");
+        assert_eq!(
+            state["clean"].as_bool(),
+            Some(true),
+            "正常暂停后侧车应标记 clean（可安全续传）"
+        );
+
+        // 恢复：fast-down 读侧车 → invert 剩余区间 → 并行续传 → 完成
+        tm.resume(gid).expect("恢复应成功");
+        assert!(wait_status(&repo, gid, TaskStatus::Complete));
+
+        // 文件完整（并行分块 + 字节级续传未损坏内容）
+        assert_completed_with_file(&repo, gid, &content);
+        // 完成后侧车已清理（任务完结，无需恢复依据）
+        assert!(
+            !Path::new(&sidecar).exists(),
+            "下载完成后应删除侧车状态文件"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2153,6 +2461,8 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn add_torrent_creates_bt_task_and_purge_clears_removed() {
+        // 持 BT 测试串行锁（见 BT_TEST_LOCK 注释：librqbit DHT 共享 dht.dat 端口）
+        let _guard = BT_TEST_LOCK.lock().unwrap();
         let (tm, repo, _temp) = test_manager(1);
         // add_torrent：真实实现（magnet → metadata 任务，引擎懒初始化 librqbit Session）
         let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
@@ -2208,10 +2518,92 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // 测试 7b：add_uri 对 magnet: 链接按 aria2 语义路由到 BT 引擎
+    // （前端 AddTask 的 URI 标签页把磁力走 addUri 通道；若按 HTTP 处理会
+    //  报 builder error，本测试断言返回 gid 且任务为磁力 metadata 阶段）
+    // ------------------------------------------------------------------
+    #[test]
+    fn add_uri_routes_magnet_to_bt_engine() {
+        // 持 BT 测试串行锁（见 BT_TEST_LOCK 注释：librqbit DHT 共享 dht.dat 端口）
+        let _guard = BT_TEST_LOCK.lock().unwrap();
+        let (tm, repo, _temp) = test_manager(1);
+        let magnet = "magnet:?xt=urn:btih:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let gids = tm
+            .add_uri(&[magnet.to_string()], &json!({}))
+            .expect("add_uri 对 magnet 应路由到 BT 引擎并成功");
+        assert_eq!(gids.len(), 1);
+        let gid = &gids[0];
+        assert_eq!(gid.len(), 16);
+
+        // 任务为磁力 metadata 阶段（bittorrent 存在、info_name=None、totalLength=0）
+        let task = repo
+            .lock()
+            .unwrap()
+            .get(gid)
+            .expect("magnet 路由应创建任务")
+            .clone();
+        let bt = task.bittorrent.as_ref().expect("应为 BT 任务");
+        assert!(bt.info_name.is_none(), "磁力 metadata 阶段应省略 info");
+        assert_eq!(task.total_length, 0);
+        // 混合场景：magnet + HTTP URL 一起添加，各自创建任务
+        let gids2 = tm
+            .add_uri(
+                &[magnet.to_string(), "http://127.0.0.1:9/file".to_string()],
+                &json!({}),
+            )
+            .expect("混合 magnet + http 应成功");
+        assert_eq!(gids2.len(), 2);
+        let bt_task = repo.lock().unwrap().get(&gids2[0]).unwrap().clone();
+        assert!(bt_task.bittorrent.is_some(), "第一个应为 BT 任务");
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 7c：重启后恢复的 BT 任务可 resume（懒创建 BT 引擎）
+    // 模拟 checkpoint 恢复：任务直接进仓库（Paused、带 bittorrent），且
+    // `tm.bt` 引擎未初始化（本进程没有 add_torrent 调用）——resume 应懒创建
+    // 引擎并成功（此前会因"BT 引擎未初始化"失败，导致暂停后重启无法续传）。
+    // ------------------------------------------------------------------
+    #[test]
+    fn resume_bt_task_after_restart_lazily_creates_engine() {
+        // 持 BT 测试串行锁（见 BT_TEST_LOCK 注释）
+        let _guard = BT_TEST_LOCK.lock().unwrap();
+        let (tm, repo, _temp) = test_manager(1);
+        // 模拟 checkpoint 恢复：BT 任务直接进仓库（Paused），未登记 task_options
+        let gid = "aaaa1111bbbb2222".to_string();
+        let mut task = Task::new_bt_task(
+            &gid,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "/tmp/dl",
+            Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        );
+        task.status = TaskStatus::Paused; // 导入恢复场景直接赋值（绕过状态机）
+        repo.lock().unwrap().add(task);
+        // 引擎尚未初始化（模拟重启后首启）
+        assert!(
+            tm.bt.lock().unwrap().is_none(),
+            "测试前置：BT 引擎应尚未初始化"
+        );
+
+        // 恢复：应懒创建 BT 引擎并成功置 Active
+        tm.resume(&gid).expect("重启后恢复 BT 任务应成功");
+        assert!(
+            tm.bt.lock().unwrap().is_some(),
+            "resume 后 BT 引擎应已懒创建"
+        );
+        let restored = repo.lock().unwrap().get(&gid).unwrap().clone();
+        assert_eq!(restored.status, TaskStatus::Active);
+        // 已登记运行集合（占用并发槽位）
+        assert!(tm.bt_active.lock().unwrap().contains(&gid));
+    }
+
+    // ------------------------------------------------------------------
     // 测试 8：checkpoint 恢复任务兜底（Task 13 续传边界修复）
     // 构造 Task（files[0].uris 有 URL、Paused）直接进仓库、不登记 task_uris /
     // task_options（与 session.rs::restore_checkpoint 现状一致），resume 应能
     // 经 files 兜底 URL + 全局选项兜底启动引擎并下载完成。
+    // **边界**：任务记录了 completed_length > 0（checkpoint 进度）但磁盘文件缺失
+    // （旧版暂停删文件兜底 / 手动删除 / 数据清理）——顺序引擎必须"从头下载"，
+    // 绝不能把零字节文件 set_len 扩展成假前缀导致损坏。
     // ------------------------------------------------------------------
     #[test]
     fn resume_restored_task_falls_back_to_files_uris() {
@@ -2231,13 +2623,21 @@ mod tests {
         );
         task.status = TaskStatus::Paused; // 导入恢复场景直接赋值（绕过状态机）
         task.total_length = content.len() as u64; // checkpoint 记录了总长（探总长结果）
+        // checkpoint 记录了部分进度，但**磁盘上没有该文件**（旧版删文件兜底场景）
+        task.completed_length = 10_000;
+        let out_path = task.files[0].path.clone();
         repo.lock().unwrap().add(task);
+        assert!(
+            !std::path::Path::new(&out_path).exists(),
+            "测试前置：文件应不存在（模拟旧版删文件兜底）"
+        );
 
-        // 恢复：内部表缺失时应从 files[0].uris 兜底 URL 并启动引擎
+        // 恢复：内部表缺失时应从 files[0].uris 兜底 URL 并启动引擎；
+        // 文件缺失 + completed>0 → 顺序引擎从头下载（不产生零前缀假文件）
         tm.resume(&gid).expect("恢复 checkpoint 任务应成功");
         assert!(wait_status(&repo, &gid, TaskStatus::Complete), "兜底恢复的任务未完成");
 
-        // 下载写回了任务的保存路径且内容与服务器一致
+        // 下载写回了任务的保存路径且内容与服务器一致（从头下载，无零字节假前缀）
         assert_completed_with_file(&repo, &gid, &content);
     }
 

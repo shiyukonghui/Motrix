@@ -160,6 +160,11 @@ impl EngineOptions {
         } else if let Some(max_per_server) = get_num("max-connection-per-server") {
             self.connections = max_per_server.max(1) as u32;
         }
+        // 连接数：任务级 `connections`（Motrix 既有前端/测试直接下发连接数，
+        // 等价 split 与 max-connection-per-server 取小的结果；显式指定时优先）
+        if let Some(v) = get_num("connections") {
+            self.connections = v.max(1) as u32;
+        }
 
         if let Some(v) = get_num("max-download-limit") {
             self.max_download_limit = (v > 0).then_some(v);
@@ -616,6 +621,28 @@ mod tests {
         assert_eq!(opts.normalized_max_tries(), 100);
         opts.max_tries = 5;
         assert_eq!(opts.normalized_max_tries(), 5);
+    }
+
+    #[test]
+    fn apply_task_options_connections_key_overrides() {
+        // 任务级显式 connections（Motrix 既有前端/测试直接下发连接数）
+        let mut opts = EngineOptions::default();
+        opts.apply_task_options(&serde_json::json!({ "connections": 1 }));
+        assert_eq!(opts.connections, 1);
+
+        // 显式 connections 优先于 split / max-connection-per-server 组合
+        let mut opts = EngineOptions::default();
+        opts.apply_task_options(&serde_json::json!({
+            "split": 8,
+            "max-connection-per-server": 4,
+            "connections": 2,
+        }));
+        assert_eq!(opts.connections, 2);
+
+        // connections 为 0（非法）→ 至少为 1
+        let mut opts = EngineOptions::default();
+        opts.apply_task_options(&serde_json::json!({ "connections": 0 }));
+        assert_eq!(opts.connections, 1);
     }
 
     // ------------------------------------------------------------------

@@ -22,6 +22,21 @@ Kget = { workspace = true }
 # 0.13 实际特性名，default-tls 亦等价 rustls），与 KGet 启用的特性并集一致，不会引入
 # 额外的 TLS 后端重复编译
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# 并行 HTTP 下载引擎（用户选定方案，替换 KGet 的 AdvancedDownloader 并行路径）：
+# fast-down 5.0.2（MIT，官方站点 fd.s121.top）= fast-pull（工作窃取并发核心）+
+# reqwest 异步客户端 + HttpPuller/FastDownPuller + Prefetch（URL 探测）。
+# 特性 fast-puller 同时启用 http + reqwest；不启用 reqwest-tls（TLS 复用上面
+# reqwest 0.13 的 rustls 特性并集，避免引入 native-tls 重复编译）。
+# 恢复语义：并行分块无"文件大小=已下载前缀"保证，由本 crate 的 fastdown.rs 通过
+# 侧车状态文件（*.fd.json）记录已完成区间（Event::PushProgress + merge_progress），
+# 恢复时 invert 求剩余区间，实现真正的字节级断点续传。
+fast-down = { version = "5.0.2", default-features = false, features = ["fast-puller"] }
+# fast-down 的 FastDownPullerOptions 需要 url::Url 构造；bytes 是 fast-pull Pusher
+# trait（push(&ProgressEntry, bytes::Bytes)）的签名依赖；parking_lot 用于构造
+# FastDownPullerOptions.resp（预取响应复用，类型为 Arc<parking_lot::Mutex<..>>）
+url = "2"
+bytes = "1"
+parking_lot = "0.12"
 # BitTorrent 引擎（Phase 3）：librqbit 是 rqbit 客户端的主库（Apache-2.0，纯 Rust），
 # 提供 DHT / PEX / ut_metadata / uTP / Web Seeds / 文件选择等成熟能力，不自研 BT 协议。
 # 版本精确锁定 =8.1.1（crates.io 当前最新稳定版；9.0.0-rc 为预发布不采用）。
@@ -41,3 +56,7 @@ motrix-rpc = { path = "../motrix-rpc" }
 tokio = { workspace = true }
 # 集成测试构造任务 options JSON（json! 宏）
 serde_json = { workspace = true }
+# BT 回归测试（同 info_hash 重复添加共享 handle）：构造最小合法 .torrent 需计算
+# pieces 的 SHA1（sha1）+ 临时目录（tempfile）；两者均已在 Cargo.lock 依赖树中
+sha1 = "0.10"
+tempfile = "3"

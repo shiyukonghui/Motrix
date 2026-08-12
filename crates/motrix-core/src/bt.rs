@@ -25,6 +25,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,15 +43,23 @@ pub const DEFAULT_BITFIELD_CHARS: usize = 240;
 /// 进度轮询间隔（毫秒）
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 磁力后台添加的超时（librqbit resolve_magnet 等待 metadata 的上限；
+/// 磁力单次添加尝试的超时（librqbit resolve_magnet 等待 metadata 的**单次**上限；
 /// 无 DHT / tracker 响应时兜底，避免后台线程永久挂起）
 const MAGNET_ADD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 磁力 metadata 超时后的重试间隔（aria2 语义：磁力任务持续等待 metadata，
+/// 不会因单次超时判失败；间隔后重新发起 resolve 尝试）
+const MAGNET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// BT 引擎会话级配置（由 EngineOptions 映射而来）
 #[derive(Debug, Clone)]
 pub struct BtEngineConfig {
     /// TCP 监听端口范围（`listen-port` 起始；范围取 100 端口避免多实例 / 测试并行冲突）
     pub listen_port_range: Option<std::ops::Range<u16>>,
+    /// 是否禁用 DHT 路由表持久化（迁移文档 7.1：librqbit 的 dht.dat 与 aria2 格式不同，
+    /// **重建可接受**；禁用后每次启动重新自举 DHT，且避免多实例 / 测试进程共享同一
+    /// dht.dat 记录端口导致的绑定冲突（os error 10048））
+    pub disable_dht_persistence: bool,
 }
 
 /// 单个 BT 任务的添加选项（TaskManager::add_torrent 组装）
@@ -156,10 +165,8 @@ pub struct PeerInfo {
     pub upload_speed: u64,
 }
 
-/// 引擎内登记的一个 torrent（gid ↔ librqbit handle 映射）
+/// 引擎内登记的一个 torrent（gid ↔ librqbit handle 映射；gid 即登记表键）
 struct TorrentEntry {
-    /// 任务 gid（TaskManager 侧 id）
-    gid: String,
     /// librqbit 托管 torrent 句柄
     handle: Arc<ManagedTorrent>,
     /// 事件回调（捕获 Arc<TaskManager>，轮询线程内调用）
@@ -167,10 +174,6 @@ struct TorrentEntry {
     /// 磁力 metadata 是否已通知（只通知一次）
     metadata_notified: bool,
 }
-
-/// librqbit torrent 内部 id（usize 别名，见 librqbit session.rs `pub type TorrentId = usize`；
-/// 未 re-export 到 crate 根，这里用原始 usize 类型）
-type TorrentId = usize;
 
 /// BitTorrent 引擎：内部自持 tokio Runtime + librqbit Session
 ///
@@ -181,8 +184,18 @@ pub struct BtEngine {
     rt: tokio::runtime::Runtime,
     /// librqbit 会话（DHT / TCP 监听 / tracker 通信）
     session: Arc<Session>,
-    /// torrent 登记表（librqbit TorrentId → 条目）
-    torrents: Mutex<HashMap<TorrentId, TorrentEntry>>,
+    /// torrent 登记表（**gid → 条目**）
+    ///
+    /// 以 gid 为键而非 librqbit TorrentId：librqbit 8.1.1 按 info_hash 去重——
+    /// 重复添加同一种子（同 info_hash 的磁力）返回同一 handle，若以 TorrentId
+    /// 为键会导致后添加任务的登记**覆盖**先添加任务（其回调被替换、进度冻结）；
+    /// 以 gid 为键则多个任务可共享同一 handle，各自收到 MetadataReady / Progress
+    /// 回调（同一底层下载，进度 / 速度一致），符合 aria2 重复种子语义。
+    torrents: Mutex<HashMap<String, TorrentEntry>>,
+    /// 磁力 metadata 待解析表（gid → 取消标志）：后台重试循环在每次尝试之间
+    /// 检查标志；任务被暂停 / 移除时置位，循环立即退出（aria2 语义下超时
+    /// 不判失败，而是持续重试，直到成功、暂停或移除）
+    pending_adds: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl BtEngine {
@@ -205,6 +218,9 @@ impl BtEngine {
             .block_on(async {
                 let opts = SessionOptions {
                     listen_port_range: config.listen_port_range,
+                    // 禁用 DHT 持久化（见 BtEngineConfig 注释）：避免共享 dht.dat
+                    // 复用端口导致多实例 / 测试冲突；DHT 本身仍启用（随机端口）
+                    disable_dht_persistence: config.disable_dht_persistence,
                     ..Default::default()
                 };
                 Session::new_with_opts(default_dir, opts).await
@@ -214,6 +230,7 @@ impl BtEngine {
             rt,
             session,
             torrents: Mutex::new(HashMap::new()),
+            pending_adds: Mutex::new(HashMap::new()),
         });
         // 3. 拉起进度轮询任务（约 500ms 一次，见 poll_once）
         engine.start_poll_loop();
@@ -253,50 +270,105 @@ impl BtEngine {
     ) -> Result<MagnetMeta, String> {
         // 预解析磁力链接（info_hash / dn 等）：同步、不依赖网络
         let parsed = parse_magnet(magnet).ok_or_else(|| format!("无效的磁力链接: {magnet}"))?;
-        let add_opts = make_add_options(opts);
+        // 该 gid 已在解析 metadata（后台重试循环进行中）→ 直接复用，不重复起线程
+        // （ensure_bt_registered 与 add_torrent 的 promote 路径都可能触达此处）
+        if self.pending_adds.lock().unwrap().contains_key(gid) {
+            return Ok(MagnetMeta {
+                info_hash: parsed.info_hash,
+                name: parsed.display_name,
+            });
+        }
         // 后台线程执行 librqbit add（阻塞等待 metadata 期间不阻塞调用方）
-        self.spawn_magnet_add(magnet.to_string(), add_opts, gid.to_string(), on_event);
+        self.spawn_magnet_add(magnet.to_string(), opts.clone(), gid.to_string(), on_event);
         Ok(MagnetMeta {
             info_hash: parsed.info_hash,
             name: parsed.display_name,
         })
     }
 
+    /// 取消磁力 metadata 解析（任务被暂停 / 移除时由 TaskManager 调用）
+    ///
+    /// 仅置位取消标志：后台重试循环在**每次尝试之间**检查，最迟在本次
+    /// 单次超时（[`MAGNET_ADD_TIMEOUT`]）后退出；正在进行的 librqbit
+    /// resolve 调用无法中断，属预期（由单次超时兜底）。
+    pub fn cancel_pending_add(&self, gid: &str) {
+        if let Ok(guard) = self.pending_adds.lock() {
+            if let Some(flag) = guard.get(gid) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
     /// 在后台 std 线程执行 `session.add_torrent(AddTorrent::Url(magnet))`
     ///
-    /// 完成（或失败）后经 `on_event` 回调；成功时把句柄登记进引擎（轮询随即接管
-    /// metadata 就绪检测与进度更新）。线程持有 `Runtime::Handle`（非阻塞），
-    /// 引擎 Drop 后 `block_on` 因 runtime 关闭立即返回错误，线程安全退出。
-    /// **metadata 超时保护**：resolve_magnet 在无 DHT / tracker 响应的环境下可能
-    /// 长期不返回，用 30 秒超时兜底（超时按添加失败回调，线程退出）。
+    /// 完成（或成功登记）后经 `on_event` 回调；线程持有 `Runtime::Handle`
+    /// （非阻塞），引擎 Drop 后 `block_on` 因 runtime 关闭立即返回错误退出。
+    ///
+    /// **metadata 重试语义（aria2 对齐）**：resolve_magnet 在无 DHT / tracker
+    /// 响应的环境下可能长期不返回，这里用 [`MAGNET_ADD_TIMEOUT`] 做**单次**超时
+    /// 兜底；超时**不判失败**，间隔 [`MAGNET_RETRY_INTERVAL`] 后重新发起 resolve，
+    /// 直到 metadata 成功、任务被暂停 / 移除（`cancel_pending_add` 置位取消标志）
+    /// 或引擎关闭。真正无效的磁力（解析即报错）仍回调 [`BtEvent::AddFailed`]。
     fn spawn_magnet_add(
         self: &Arc<Self>,
         magnet: String,
-        add_opts: AddTorrentOptions,
+        bt_opts: BtAddOptions,
         gid: String,
         on_event: impl Fn(BtEvent) + Send + Sync + 'static,
     ) {
         let this = self.clone();
         let session = self.session.clone();
         let handle = self.rt.handle().clone();
+        // 取消标志：登记进 pending_adds（供 TaskManager pause / remove 时取消），
+        // 线程退出时移除
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut guard) = self.pending_adds.lock() {
+            guard.insert(gid.clone(), cancel.clone());
+        }
         std::thread::spawn(move || {
-            let result = handle.block_on(async move {
-                tokio::time::timeout(
-                    MAGNET_ADD_TIMEOUT,
-                    session.add_torrent(AddTorrent::Url(Cow::Owned(magnet.into())), Some(add_opts)),
-                )
-                .await
-            });
-            match result {
-                Ok(Ok(resp)) => {
-                    if let Some(torrent_handle) = resp.into_handle() {
-                        this.register(&gid, torrent_handle, on_event);
-                    } else {
-                        on_event(BtEvent::AddFailed("磁力任务未返回托管句柄".to_string()));
+            loop {
+                // 每次尝试构建新的 AddTorrentOptions（librqbit 该类型未实现 Clone，
+                // 故线程持有可 Clone 的 BtAddOptions 并在循环内重建）
+                let session = session.clone();
+                let magnet = magnet.clone();
+                let add_opts = make_add_options(&bt_opts);
+                let result = handle.block_on(async move {
+                    tokio::time::timeout(
+                        MAGNET_ADD_TIMEOUT,
+                        session.add_torrent(
+                            AddTorrent::Url(Cow::Owned(magnet)),
+                            Some(add_opts),
+                        ),
+                    )
+                    .await
+                });
+                match result {
+                    // 成功：登记句柄，结束循环
+                    Ok(Ok(resp)) => {
+                        if let Some(torrent_handle) = resp.into_handle() {
+                            this.register(&gid, torrent_handle, on_event);
+                        } else {
+                            on_event(BtEvent::AddFailed("磁力任务未返回托管句柄".to_string()));
+                        }
+                        break;
                     }
+                    // 解析级错误（如磁力无效）：按添加失败处理
+                    Ok(Err(e)) => {
+                        on_event(BtEvent::AddFailed(format!("添加磁力失败: {e:#}")));
+                        break;
+                    }
+                    // 单次超时：不判失败——检查取消标志后进入下一次尝试
+                    Err(_) => {}
                 }
-                Ok(Err(e)) => on_event(BtEvent::AddFailed(format!("添加磁力失败: {e:#}"))),
-                Err(_) => on_event(BtEvent::AddFailed("磁力 metadata 获取超时".to_string())),
+                // 任务被暂停 / 移除（或引擎关闭）：取消标志置位则退出
+                if cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(MAGNET_RETRY_INTERVAL);
+            }
+            // 线程退出：从 pending_adds 移除（引擎已 drop 时锁失败静默）
+            if let Ok(mut guard) = this.pending_adds.lock() {
+                guard.remove(&gid);
             }
         });
     }
@@ -339,28 +411,21 @@ impl BtEngine {
             })
     }
 
-    /// 登记 torrent（magnet：metadata 未通知；同一 TorrentId 已登记时以新 gid 接管）
+    /// 登记 torrent（magnet：metadata 未通知）
+    ///
+    /// 以 gid 为键：同 info_hash 的磁力重复添加时 librqbit 返回同一 handle
+    /// （`AddTorrentResponse::AlreadyManaged`），多个任务共享该 handle 各自登记，
+    /// 不覆盖先添加任务的回调（修复：此前以 TorrentId 为键导致后任务覆盖前任务、
+    /// 前任务进度冻结）。
     fn register(
         &self,
         gid: &str,
         handle: Arc<ManagedTorrent>,
         on_event: impl Fn(BtEvent) + Send + Sync + 'static,
     ) {
-        let id = handle.id();
-        let mut guard = self.torrents.lock().unwrap();
-        if let Some(existing) = guard.get(&id) {
-            if existing.gid != gid {
-                warn!(
-                    "[Motrix] BT 任务重复添加同一种子：gid {old} 的引擎登记由新任务 {new} 接管（info_hash 相同）",
-                    old = existing.gid,
-                    new = gid
-                );
-            }
-        }
-        guard.insert(
-            id,
+        self.torrents.lock().unwrap().insert(
+            gid.to_string(),
             TorrentEntry {
-                gid: gid.to_string(),
                 handle,
                 on_event: Arc::new(on_event),
                 metadata_notified: false,
@@ -375,21 +440,9 @@ impl BtEngine {
         handle: Arc<ManagedTorrent>,
         on_event: impl Fn(BtEvent) + Send + Sync + 'static,
     ) {
-        let id = handle.id();
-        let mut guard = self.torrents.lock().unwrap();
-        if let Some(existing) = guard.get(&id) {
-            if existing.gid != gid {
-                warn!(
-                    "[Motrix] BT 任务重复添加同一种子：gid {old} 的引擎登记由新任务 {new} 接管（info_hash 相同）",
-                    old = existing.gid,
-                    new = gid
-                );
-            }
-        }
-        guard.insert(
-            id,
+        self.torrents.lock().unwrap().insert(
+            gid.to_string(),
             TorrentEntry {
-                gid: gid.to_string(),
                 handle,
                 on_event: Arc::new(on_event),
                 metadata_notified: true,
@@ -401,7 +454,7 @@ impl BtEngine {
     pub fn contains(&self, gid: &str) -> bool {
         self.torrents
             .lock()
-            .map(|g| g.values().any(|e| e.gid == gid))
+            .map(|g| g.contains_key(gid))
             .unwrap_or(false)
     }
 
@@ -410,20 +463,8 @@ impl BtEngine {
         self.torrents
             .lock()
             .map_err(|e| format!("获取 BT 登记表锁失败: {e}"))?
-            .values()
-            .find(|e| e.gid == gid)
+            .get(gid)
             .map(|e| e.handle.clone())
-            .ok_or_else(|| format!("BT 任务不在引擎中: {gid}"))
-    }
-
-    /// 按 gid 查 librqbit TorrentId
-    fn id_by_gid(&self, gid: &str) -> Result<TorrentId, String> {
-        self.torrents
-            .lock()
-            .map_err(|e| format!("获取 BT 登记表锁失败: {e}"))?
-            .values()
-            .find(|e| e.gid == gid)
-            .map(|e| e.handle.id())
             .ok_or_else(|| format!("BT 任务不在引擎中: {gid}"))
     }
 
@@ -454,21 +495,40 @@ impl BtEngine {
     }
 
     /// 移除 BT 任务（librqbit session.delete：**保留已下载文件**，与 aria2 remove 一致）；
-    /// 同时从登记表移除（轮询不再更新该任务）
+    /// 同时从登记表移除（轮询不再更新该任务）。
+    ///
+    /// 同 info_hash 重复添加时多个任务共享同一 librqbit torrent（见登记表注释）：
+    /// 仅当**最后一个**共享任务被移除时才 `session.delete`；否则只移除本任务登记，
+    /// 共享下载继续（其余任务不受影响）。
     pub fn remove(&self, gid: &str) -> Result<(), String> {
-        let id = self.id_by_gid(gid)?;
-        let session = self.session.clone();
-        self.rt
-            .block_on(async move {
+        let (id, has_other) = {
+            let guard = self
+                .torrents
+                .lock()
+                .map_err(|e| format!("获取 BT 登记表锁失败: {e}"))?;
+            let entry = guard
+                .get(gid)
+                .ok_or_else(|| format!("BT 任务不在引擎中: {gid}"))?;
+            let id = entry.handle.id();
+            // 是否存在其他任务共享同一 librqbit torrent（同 info_hash）
+            let has_other = guard
+                .iter()
+                .any(|(other_gid, e)| other_gid != gid && e.handle.id() == id);
+            (id, has_other)
+        };
+        if !has_other {
+            let session = self.session.clone();
+            self.rt.block_on(async move {
                 session
                     .delete(TorrentIdOrHash::Id(id), false)
                     .await
                     .map_err(|e| format!("移除 BT 任务失败: {e:#}"))
             })?;
+        }
         self.torrents
             .lock()
             .map_err(|e| format!("获取 BT 登记表锁失败: {e}"))?
-            .remove(&id);
+            .remove(gid);
         Ok(())
     }
 
@@ -507,32 +567,30 @@ impl BtEngine {
     /// 单次轮询：遍历全部登记的 torrent，读取 stats → 构造事件 → 回调
     fn poll_once(&self) {
         // 先取快照（不持锁调用 librqbit，避免长时间持锁阻塞 add/remove）
-        let entries: Vec<(TorrentId, String, Arc<ManagedTorrent>, Arc<dyn Fn(BtEvent) + Send + Sync>, bool)> =
-            match self.torrents.lock() {
-                Ok(guard) => guard
-                    .iter()
-                    .map(|(id, e)| {
-                        (
-                            *id,
-                            e.gid.clone(),
-                            e.handle.clone(),
-                            e.on_event.clone(),
-                            e.metadata_notified,
-                        )
-                    })
-                    .collect(),
-                Err(e) => {
-                    warn!("[Motrix] BT 轮询获取登记表锁失败: {e}");
-                    return;
-                }
-            };
-        for (id, _gid, handle, on_event, metadata_notified) in entries {
+        let entries: Vec<(
+            String,
+            Arc<ManagedTorrent>,
+            Arc<dyn Fn(BtEvent) + Send + Sync>,
+            bool,
+        )> = match self.torrents.lock() {
+            Ok(guard) => guard
+                .iter()
+                .map(|(gid, e)| {
+                    (gid.clone(), e.handle.clone(), e.on_event.clone(), e.metadata_notified)
+                })
+                .collect(),
+            Err(e) => {
+                warn!("[Motrix] BT 轮询获取登记表锁失败: {e}");
+                return;
+            }
+        };
+        for (gid, handle, on_event, metadata_notified) in entries {
             // 1) metadata 阶段（磁力任务）：就绪后回调一次 MetadataReady
             if !metadata_notified {
                 if let Ok(meta) = handle.with_metadata(|m| build_torrent_meta(&handle, m)) {
                     on_event(BtEvent::MetadataReady(meta));
                     if let Ok(mut guard) = self.torrents.lock() {
-                        if let Some(e) = guard.get_mut(&id) {
+                        if let Some(e) = guard.get_mut(&gid) {
                             e.metadata_notified = true;
                         }
                     }
@@ -819,6 +877,13 @@ pub fn decode_torrent_base64(input: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("base64 解码种子内容失败: {e}"))
 }
 
+/// BT 测试串行锁：librqbit 的 DHT 路由表会持久化到用户配置目录的共享 `dht.dat`
+/// 并复用其中记录的端口；两个并发 BT 会话会争抢同一 DHT 端口，导致第二个会话
+/// 初始化失败（os error 10048 "只允许使用一次"）。涉及 BT 会话创建的测试
+/// （本模块 + engine.rs 的 add_torrent / add_uri 磁力路由）须持有该锁串行执行。
+#[cfg(test)]
+pub(crate) static BT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,5 +1031,79 @@ mod tests {
         assert_eq!(percent_decode("udp%3A%2F%2Fhost%3A80"), "udp://host:80");
         assert_eq!(percent_decode("plain-text"), "plain-text");
         assert_eq!(percent_decode("100%"), "100%"); // 非法的 % 序列原样保留
+    }
+
+    // ------------------------------------------------------------------
+    // 同一 info_hash 重复添加：多个 gid 共享同一 librqbit handle（回归测试）
+    // ------------------------------------------------------------------
+
+    /// 构造最小合法单文件种子（1 字节内容、1 个 piece、piece 长 16384）
+    ///
+    /// bencode 结构：`d 8:announce 0: 4:info d 6:length i1e 4:name 1:a
+    /// 12:piece length i16384e 6:pieces 20:<sha1> e e`（字典键按字典序，bencode 规范；
+    /// 注意 announce 为空字符串的写法是 `0:` 后紧跟下一键，不能多写 `e`）
+    fn build_minimal_torrent(content: &[u8]) -> Vec<u8> {
+        use sha1::Digest;
+        let hash = sha1::Sha1::digest(content);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d8:announce0:4:infod6:lengthi");
+        out.extend_from_slice(content.len().to_string().as_bytes());
+        out.extend_from_slice(b"e4:name1:a12:piece lengthi16384e6:pieces20:");
+        out.extend_from_slice(&hash);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    /// 回归测试（修复同种双任务"名称/文件一致但速度冻结"问题）：
+    ///
+    /// 重复添加同一 info_hash 的 .torrent 时，librqbit 按 info_hash 去重返回
+    /// 同一 handle（`AddTorrentResponse::AlreadyManaged`）。登记表以 **gid** 为键 →
+    /// 两个任务都保持登记（互不覆盖，各自收到回调）；移除其中一个不删除共享的
+    /// 底层 torrent（仅当最后一个共享者移除时才 session.delete），另一任务继续。
+    #[test]
+    fn duplicate_torrent_shared_handle_keeps_both_gids() {
+        let _guard = BT_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().expect("创建临时目录失败");
+        let dir = temp.path().to_string_lossy().to_string();
+        // 监听端口用高位段，避免与 engine.rs BT 测试的默认 listen-port 冲突
+        let engine = BtEngine::new(
+            BtEngineConfig {
+                listen_port_range: Some(26_000..26_100),
+                disable_dht_persistence: true,
+            },
+            &dir,
+        )
+        .expect("创建 BT 引擎失败");
+        let torrent = build_minimal_torrent(b"X");
+        let opts = BtAddOptions {
+            dir: dir.clone(),
+            paused: true, // 仅登记不下载（避免落盘干扰断言）
+            ..Default::default()
+        };
+        let gid1 = "aaaaaaaaaaaaaaaa";
+        let gid2 = "bbbbbbbbbbbbbbbb";
+
+        engine
+            .add_torrent_file(&torrent, &opts, gid1, |_| {})
+            .expect("第一次添加 .torrent 应成功");
+        engine
+            .add_torrent_file(&torrent, &opts, gid2, |_| {})
+            .expect("重复添加同一 .torrent 应成功（librqbit 去重返回同一 handle）");
+
+        // 两个 gid 都应保持登记（旧实现以 TorrentId 为键 → 后者覆盖前者、前者冻结）
+        assert!(engine.contains(gid1), "第一个任务登记不应被第二个任务覆盖");
+        assert!(engine.contains(gid2), "第二个任务应已登记");
+
+        // 移除 gid1：gid2 仍共享同一 handle → 不删除底层 torrent，gid2 保持登记
+        engine.remove(gid1).expect("移除 gid1 应成功");
+        assert!(!engine.contains(gid1));
+        assert!(
+            engine.contains(gid2),
+            "共享 handle 的任务被移除不应影响另一任务的登记"
+        );
+
+        // 移除 gid2（最后一个共享者）→ 正常删除底层 torrent
+        engine.remove(gid2).expect("移除 gid2 应成功");
+        assert!(!engine.contains(gid2));
     }
 }

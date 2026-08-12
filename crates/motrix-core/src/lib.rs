@@ -17,6 +17,8 @@ pub mod broadcaster;
 pub mod bt;
 pub mod config;
 pub mod engine;
+pub mod fastdown;
+pub mod http;
 pub mod kget;
 pub mod options;
 pub mod rpc_backend;
