@@ -25,7 +25,17 @@ const updateTray = is.renderer()
     }
 
     const ab = await tray.arrayBuffer()
-    ipcRenderer.send('command', 'application:update-tray', ab)
+    // —— Tauri 桥接修正（Phase 4）：emit 无法正确序列化 ArrayBuffer（JSON.stringify 后为空对象），
+    //    改为发送 { width, height, data: [...] } 结构化载荷。
+    //    尺寸约定：TRAY_CANVAS_CONFIG（66×16，src/shared/constants.js）× scale(2) = 132×32，
+    //    Rust 端按 132×32 约定构造托盘图标（载荷为 PNG 编码时 Rust 端自动解码出真实宽高）。
+    //    ab 为 PNG 编码字节（worker 的 convertToBlob 输出），宽度/高度仅作原始 RGBA 回退用。
+    const bytes = new Uint8Array(ab)
+    ipcRenderer.send('command', 'application:update-tray', {
+      width: 132,
+      height: 32,
+      data: Array.from(bytes)
+    })
   }
   : () => {}
 

@@ -28,7 +28,9 @@ use serde_json::Value;
 use crate::config::SystemConfig;
 
 /// 引擎配置（由 aria2 systemKeys / 任务级选项映射而来，纯数据、可测试）
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 注：含 `seed_ratio: Option<f64>` 等浮点字段，无法派生 `Eq`，仅实现 `PartialEq`。
+#[derive(Debug, Clone, PartialEq)]
 pub struct EngineOptions {
     /// 并行连接数（`max-connection-per-server` / `split` → 取两者较小值，
     /// 与 aria2 "split 且不超过 max-connection-per-server" 语义一致；
@@ -60,6 +62,26 @@ pub struct EngineOptions {
     pub dir: String,
     /// 输出文件名（任务级 `out` 选项；`None` 时由 KGet 从 URL 推断文件名）
     pub out: Option<String>,
+    // ------------------------------------------------------------------
+    // BitTorrent 选项（Phase 3，librqbit 集成，见 MIGRATION-TAURI.md 5.5）
+    // ------------------------------------------------------------------
+    /// 附加 tracker 列表（对应 `bt-tracker`，逗号分隔字符串或数组；
+    /// 传给 librqbit 的 AddTorrentOptions.trackers，与种子自带 announce 并存）
+    pub bt_trackers: Vec<String>,
+    /// BT 监听端口（对应 `listen-port`；librqbit Session 的 TCP 监听端口，
+    /// 以该端口起始的一段端口范围避免端口占用冲突）
+    pub bt_listen_port: Option<u16>,
+    /// 做种比率（对应 `seed-ratio`，如 2.0 表示上传达到下载量的 200% 后停止做种；
+    /// librqbit 无内建做种比率控制，本字段供上层做种调度决策，当前保留）
+    pub seed_ratio: Option<f64>,
+    /// 做种时长（秒，对应 `seed-time`；同上，当前保留供上层调度）
+    pub seed_time: Option<u32>,
+    /// 下载完成后是否持续做种（对应 user.json 的 `keep-seeding`；
+    /// TaskManager::add_torrent 时若任务级 options 未指定，则从 user 配置读取）
+    pub keep_seeding: bool,
+    /// 文件选择（对应任务级 `select-file`，如 "1,3" 表示只下载第 1、3 个文件，
+    /// 传给 librqbit 的 AddTorrentOptions.only_files；仅多文件种子有意义）
+    pub only_files: Option<Vec<usize>>,
 }
 
 impl EngineOptions {
@@ -98,6 +120,14 @@ impl EngineOptions {
             retry_wait,
             dir: system.dir.clone(),
             out: None,
+            // BT（Phase 3）：bt-tracker 为逗号分隔 tracker 列表；listen-port 作为
+            // librqbit TCP 监听端口；seed-ratio / seed-time 为 0 表示不限（保留字段）
+            bt_trackers: split_tracker_list(&system.bt_tracker),
+            bt_listen_port: Some(system.listen_port),
+            seed_ratio: (system.seed_ratio > 0.0).then_some(system.seed_ratio),
+            seed_time: (system.seed_time > 0).then_some(system.seed_time),
+            keep_seeding: false,
+            only_files: None,
         }
     }
 
@@ -167,6 +197,43 @@ impl EngineOptions {
         if let Some(v) = get_str("out") {
             self.out = (!v.is_empty()).then_some(v);
         }
+        // ---- BT 选项（Phase 3）----
+        // bt-tracker：逗号分隔字符串（含空格分隔）或字符串数组
+        if obj.contains_key("bt-tracker") {
+            self.bt_trackers = parse_tracker_option(obj.get("bt-tracker"));
+        }
+        // seed-ratio：数字或字符串数字（如 2.0）
+        if let Some(v) = obj.get("seed-ratio") {
+            if let Some(n) = v.as_f64() {
+                self.seed_ratio = Some(n);
+            } else if let Some(s) = v.as_str() {
+                if let Ok(n) = s.parse::<f64>() {
+                    self.seed_ratio = Some(n);
+                }
+            }
+        }
+        // seed-time：秒数
+        if let Some(v) = obj.get("seed-time") {
+            if let Some(n) = v.as_u64() {
+                self.seed_time = Some(n as u32);
+            } else if let Some(s) = v.as_str() {
+                if let Ok(n) = s.parse::<u32>() {
+                    self.seed_time = Some(n);
+                }
+            }
+        }
+        // keep-seeding：布尔（字符串 "true"/"false" 或布尔值）
+        if let Some(v) = obj.get("keep-seeding") {
+            if let Some(b) = v.as_bool() {
+                self.keep_seeding = b;
+            } else if let Some(s) = v.as_str() {
+                self.keep_seeding = matches!(s, "true" | "1");
+            }
+        }
+        // select-file：字符串 "1,3"（1 起始索引）或数字数组；转为 0 起始索引传给 librqbit
+        if let Some(v) = obj.get("select-file") {
+            self.only_files = parse_select_file(v);
+        }
     }
 
     /// 归一化的最大尝试次数
@@ -209,7 +276,75 @@ impl Default for EngineOptions {
             retry_wait: 0,
             dir: ".".to_string(),
             out: None,
+            bt_trackers: Vec::new(),
+            bt_listen_port: None,
+            seed_ratio: None,
+            seed_time: None,
+            keep_seeding: false,
+            only_files: None,
         }
+    }
+}
+
+/// 把逗号/空白分隔的 tracker 列表字符串拆成 Vec<String>（忽略空项）
+///
+/// system.json 的 `bt-tracker` 为逗号分隔字符串（aria2 惯例），
+/// 也可能是空白分隔（Electron 版 Motrix 设置界面按行编辑后存为逗号/空格混合）。
+fn split_tracker_list(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 解析任务级 `bt-tracker` 选项（字符串 或 字符串数组）为 tracker 列表
+fn parse_tracker_option(v: Option<&Value>) -> Vec<String> {
+    match v {
+        // 数组：["udp://t1:80", "https://t2/announce"]
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        // 字符串：逗号 / 空白分隔
+        Some(Value::String(s)) => split_tracker_list(s),
+        _ => Vec::new(),
+    }
+}
+
+/// 解析 `select-file` 选项为 0 起始的文件索引列表（传给 librqbit only_files）
+///
+/// aria2 的 select-file 为 1 起始索引（逗号分隔字符串或数字数组），
+/// librqbit 的文件索引为 0 起始，这里统一减 1 转换。
+fn parse_select_file(v: &Value) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    let items: Vec<String> = match v {
+        // 数组元素可为数字（如 [2, 4]）或字符串（如 ["2", "4"]）
+        Value::Array(arr) => arr
+            .iter()
+            .map(|item| {
+                if let Some(s) = item.as_str() {
+                    s.to_string()
+                } else {
+                    item.to_string()
+                }
+            })
+            .collect(),
+        Value::String(s) => s.split(',').map(str::trim).map(str::to_string).collect(),
+        _ => return None,
+    };
+    for item in items {
+        if let Ok(n) = item.parse::<usize>() {
+            if n >= 1 {
+                out.push(n - 1);
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -481,5 +616,69 @@ mod tests {
         assert_eq!(opts.normalized_max_tries(), 100);
         opts.max_tries = 5;
         assert_eq!(opts.normalized_max_tries(), 5);
+    }
+
+    // ------------------------------------------------------------------
+    // BT 选项（Phase 3）：bt-tracker / seed-ratio / seed-time / keep-seeding / select-file
+    // ------------------------------------------------------------------
+    #[test]
+    fn from_system_config_maps_bt_options() {
+        let system = system_with(|s| {
+            s.bt_tracker = "udp://tracker1:80, https://tracker2/announce".to_string();
+            s.listen_port = 21301;
+            s.seed_ratio = 2.0;
+            s.seed_time = 2880;
+        });
+        let opts = EngineOptions::from_system_config(&system);
+        // 逗号/空白分隔的 tracker 列表被拆分
+        assert_eq!(
+            opts.bt_trackers,
+            vec![
+                "udp://tracker1:80".to_string(),
+                "https://tracker2/announce".to_string()
+            ]
+        );
+        assert_eq!(opts.bt_listen_port, Some(21301));
+        assert_eq!(opts.seed_ratio, Some(2.0));
+        assert_eq!(opts.seed_time, Some(2880));
+        assert!(!opts.keep_seeding);
+        assert_eq!(opts.only_files, None);
+    }
+
+    #[test]
+    fn apply_task_options_maps_bt_keys() {
+        let mut opts = EngineOptions::default();
+        opts.apply_task_options(&serde_json::json!({
+            "bt-tracker": "udp://t1:80,udp://t2:80",
+            "seed-ratio": "1.5",
+            "seed-time": 600,
+            "keep-seeding": "true",
+            "select-file": "1,3",
+        }));
+        assert_eq!(opts.bt_trackers, vec!["udp://t1:80".to_string(), "udp://t2:80".to_string()]);
+        assert_eq!(opts.seed_ratio, Some(1.5));
+        assert_eq!(opts.seed_time, Some(600));
+        assert!(opts.keep_seeding);
+        // select-file 的 1 起始索引转为 0 起始（传给 librqbit only_files）
+        assert_eq!(opts.only_files, Some(vec![0, 2]));
+
+        // 数组形态的 bt-tracker / select-file
+        let mut opts = EngineOptions::default();
+        opts.apply_task_options(&serde_json::json!({
+            "bt-tracker": ["udp://a:80", "https://b/announce"],
+            "select-file": [2, 4],
+        }));
+        assert_eq!(opts.bt_trackers, vec!["udp://a:80".to_string(), "https://b/announce".to_string()]);
+        assert_eq!(opts.only_files, Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn split_tracker_list_handles_blank_and_whitespace() {
+        assert!(split_tracker_list("").is_empty());
+        assert!(split_tracker_list(" , , ").is_empty());
+        assert_eq!(
+            split_tracker_list("udp://a:80 udp://b:80"),
+            vec!["udp://a:80".to_string(), "udp://b:80".to_string()]
+        );
     }
 }

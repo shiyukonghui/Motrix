@@ -5,7 +5,9 @@
 members = [
     "src-tauri",
     "crates/motrix-core",
-    "crates/motrix-rpc"
+    "crates/motrix-rpc",
+    # Phase 5：CLI 命令行工具（JSON-RPC 客户端，见 MIGRATION-TAURI.md 第 9 章）
+    "crates/motrix-cli"
 ]
 resolver = "2"
 
@@ -31,3 +33,12 @@ axum = { version = "0.8", features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+# Phase 5 motrix-cli：参数解析（clap derive，见 MIGRATION-TAURI.md 9.6）
+clap = { version = "4", features = ["derive"] }
+# 人类可读进度/表格输出（可选；本阶段 CLI 用手写格式化，声明备用）
+indicatif = "0.18"
+# .torrent 文件 → base64（aria2.addTorrent 契约；版本与 motrix-core 一致避免重复编译）
+base64 = "0.21"
+# JSON-RPC 客户端 HTTP 栈：与 motrix-core 统一 reqwest 0.13 + blocking + rustls，
+# 复用同一依赖树与 rustls TLS（motrix-core/Cargo.toml 有详细说明）
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }

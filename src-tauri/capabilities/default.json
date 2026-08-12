@@ -9,6 +9,8 @@
     "core:default",
     "core:event:allow-listen",
     "core:event:allow-emit",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "notification:default",
+    "opener:default"
   ]
 }

@@ -14,7 +14,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon 特性：Phase 4 系统托盘（TrayIconBuilder / tauri::tray / tauri::mouse）
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -30,3 +31,19 @@ tokio = { workspace = true }
 rand = { workspace = true }
 # 原生 shell 能力（Task 3）：跨平台"移到回收站"（trash_item 命令）
 trash = "5"
+
+# ==================== Phase 4：平台能力补齐（Tauri 官方插件 + 轻量 crate） ====================
+# 单实例：二次启动聚焦已有窗口（tauri-plugin-single-instance，官方）
+tauri-plugin-single-instance = "2"
+# 开机自启（tauri-plugin-autostart，官方）：Windows 注册表 / macOS LaunchAgent / Linux autostart
+tauri-plugin-autostart = "2"
+# 任务完成系统通知（tauri-plugin-notification，官方）：Windows toast / macOS / Linux 通知
+tauri-plugin-notification = "2"
+# 打开外部链接 / 文件（tauri-plugin-opener，官方）：application:open-external / help:* 命令
+tauri-plugin-opener = "2"
+# UPnP 端口映射（igd crate，等价 Electron 版 @motrix/nat-api）：把 BT 监听端口映射到路由器
+igd = "0.12"
+# 托盘速度计：前端 Canvas 输出为 PNG 编码（convertToBlob），Rust 端解码为 RGBA 后
+# 交给 tauri::image::Image::new_owned 更新托盘图标（image 0.25 的 std 为内置能力，
+# 仅启用 png 特性，保持依赖精简）
+image = { version = "0.25", default-features = false, features = ["png"] }

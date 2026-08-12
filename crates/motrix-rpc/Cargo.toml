@@ -14,6 +14,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# 轻量 JSON-RPC 客户端（Phase 5，供 motrix-cli 远程模式复用）：
+# 与 motrix-core 统一 reqwest 0.13 + blocking + rustls（选型说明见 src/client.rs 模块注释），
+# 复用同一 rustls TLS 依赖树，避免为 CLI 再引入一套 HTTP 实现
+reqwest = { workspace = true }
 
 # 测试用：tower 的 ServiceExt::oneshot 直调 Router；tokio-tungstenite 作 WS 客户端
 [dev-dependencies]

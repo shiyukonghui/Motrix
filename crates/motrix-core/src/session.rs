@@ -54,7 +54,7 @@ pub struct CheckpointTask {
     pub status: String,
     /// 保存目录
     pub dir: String,
-    /// 下载源 URL 列表（从 files[].uris 收集）
+    /// 下载源 URL 列表（从 files[].uris 收集；BT 任务为磁力链接 / base64 .torrent 源）
     pub urls: Vec<String>,
     /// 保存文件名（dir 下的相对路径，恢复时重建保存路径）
     pub out: Option<String>,
@@ -66,6 +66,19 @@ pub struct CheckpointTask {
     pub error_message: Option<String>,
     /// 创建时间（unix 秒）
     pub created_at: u64,
+    // ------------------------------------------------------------------
+    // BT 任务字段（Phase 3，librqbit 集成；`#[serde(default)]` 保证旧 checkpoint
+    // 无这些键时也能正常解析，向后兼容）
+    // ------------------------------------------------------------------
+    /// 是否 BT 任务（恢复时按 BT 语义重建 bittorrent 信息）
+    #[serde(default)]
+    pub is_bt: bool,
+    /// BT 信息哈希（40 位 hex；恢复时填充 bittorrent.info_hash）
+    #[serde(default)]
+    pub info_hash: Option<String>,
+    /// 降采样 bitfield（checkpoint 保存时的进度位图；恢复时填充 task.bitfield）
+    #[serde(default)]
+    pub piece_bitmap: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +166,11 @@ pub fn checkpoint_tasks(repo: &TaskRepository) -> Vec<CheckpointTask> {
                 completed_length: t.completed_length,
                 error_message: t.error_message.clone(),
                 created_at: t.created_at,
+                // BT 字段（Phase 3）：bittorrent 存在即为 BT 任务；info_hash 与
+                // 降采样 bitfield 一并导出（恢复时重建 bittorrent / 进度位图）
+                is_bt: t.bittorrent.is_some(),
+                info_hash: t.bittorrent.as_ref().and_then(|b| b.info_hash.clone()),
+                piece_bitmap: (!t.bitfield.is_empty()).then(|| t.bitfield.clone()),
             }
         })
         .collect()
@@ -203,17 +221,46 @@ pub fn load_checkpoint(data_dir: &Path) -> Vec<CheckpointTask> {
 ///
 /// 状态映射（构造后直接赋值，绕过状态机，属"导入恢复"而非运行期迁移）：
 /// - complete 保持 complete（历史列表）
-/// - active / waiting 恢复为 waiting（下次用户 / 启动时可继续，Range 续传）
+/// - active / waiting 恢复为 waiting（下次用户 / 启动时可继续；BT 任务 resume 时
+///   经 engine::ensure_bt_registered 从源重新加入 librqbit 续传）
 /// - paused 恢复为 paused
 /// - error 保持 error（保留错误信息）
 /// - removed 保持 removed（出现在 stopped 历史）
-/// - seeding 保持 seeding（Phase 3 BT 任务）
+/// - seeding 保持 seeding（BT 做种任务）
 /// - 未知状态串回退 waiting（防御）
 ///
-/// 用 `Task::new_http_task` 重建（gid / urls / dir / out），随后赋值
-/// completed_length / total_length / error_message / created_at 等字段。
+/// HTTP 任务用 `Task::new_http_task` 重建（gid / urls / dir / out），随后赋值
+/// completed_length / total_length / error_message / created_at 等字段；
+/// **BT 任务**（`is_bt`）用 `Task::new_bt_task` 重建（bittorrent 信息 + 源），
+/// 恢复 bitfield（降采样位图）与 info_hash；metadata 阶段任务（info_name 未保存）
+/// 保持 info_name=None，resume 后由 metadata 就绪回调补齐。
 pub fn restore_checkpoint(repo: &mut TaskRepository, tasks: Vec<CheckpointTask>) {
     for ct in tasks {
+        // BT 任务：按 BT 语义重建（bittorrent 存在、源写入 files[0].uris[0]）
+        if ct.is_bt {
+            // 源：checkpoint urls 保存了磁力 / base64 .torrent（BT 任务 uris 即源）
+            let source = ct.urls.first().cloned().unwrap_or_default();
+            let mut task =
+                Task::new_bt_task(ct.gid.clone(), &source, ct.dir.clone(), ct.info_hash.clone());
+            // 恢复进度 / 错误信息 / 创建时间 / bitfield（保真）
+            task.total_length = ct.total_length;
+            task.completed_length = ct.completed_length;
+            task.error_message = ct.error_message.clone();
+            task.created_at = ct.created_at;
+            task.bitfield = ct.piece_bitmap.clone().unwrap_or_default();
+            // 状态映射（见函数注释；active/waiting → waiting 供用户手动 resume）
+            task.status = match ct.status.as_str() {
+                "complete" => TaskStatus::Complete,
+                "paused" => TaskStatus::Paused,
+                "error" => TaskStatus::Error,
+                "active" | "waiting" => TaskStatus::Waiting,
+                "removed" => TaskStatus::Removed,
+                "seeding" => TaskStatus::Seeding,
+                _ => TaskStatus::Waiting,
+            };
+            repo.add(task);
+            continue;
+        }
         // out 缺省时回退 "download"（与 engine.rs 的 file_name_from_uri 兜底一致）
         let out = ct.out.clone().unwrap_or_else(|| "download".to_string());
         let mut task = Task::new_http_task(ct.gid.clone(), &ct.urls, ct.dir.clone(), out);
@@ -469,6 +516,103 @@ fedcba9876543210 waiting /downloads/b.bin https://example.com/b.bin\r\n";
         assert_eq!(c2.completed_length, 100);
         assert_eq!(c2.error_message.as_deref(), Some("下载失败: timeout"));
         assert_eq!(c2.created_at, 333);
+
+        cleanup(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 2.5：BT checkpoint 往返（Phase 3）：is_bt / info_hash / piece_bitmap
+    //          导出 → 恢复，未完成任务以 Waiting 恢复（resume 后重新加入引擎续传）
+    // ------------------------------------------------------------------
+    #[test]
+    fn checkpoint_roundtrip_preserves_bt_fields() {
+        let dir = temp_dir();
+        // 40 位 info_hash（6 组 c0ffee + abcd）
+        let info_hash = "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd";
+        let magnet = format!("magnet:?xt=urn:btih:{info_hash}");
+
+        // 构造两个 BT 任务：未完成任务（waiting + 进度）与做种任务（seeding）
+        let mut repo = TaskRepository::new();
+        let mut bt1 = Task::new_bt_task(
+            "bt00000000000001",
+            &magnet,
+            "/downloads",
+            Some(info_hash.to_string()),
+        );
+        bt1.total_length = 1000;
+        bt1.completed_length = 400; // 部分进度（断点续传基础）
+        bt1.bitfield = "05f".to_string(); // 降采样位图占位
+        bt1.created_at = 111;
+
+        let mut bt2 = Task::new_bt_task(
+            "bt00000000000002",
+            &magnet,
+            "/downloads",
+            Some(info_hash.to_string()),
+        );
+        bt2.total_length = 1000;
+        bt2.completed_length = 1000;
+        bt2.status = TaskStatus::Seeding; // 做种中
+        bt2.created_at = 222;
+
+        repo.add(bt1);
+        repo.add(bt2);
+
+        // 导出 → 保存 → 加载
+        let exported = checkpoint_tasks(&repo);
+        assert_eq!(exported.len(), 2);
+        assert!(exported.iter().all(|c| c.is_bt));
+        assert!(exported
+            .iter()
+            .all(|c| c.info_hash.as_deref() == Some(info_hash)));
+        assert_eq!(exported[0].piece_bitmap.as_deref(), Some("05f"));
+        // BT 任务的 urls 保存了源（磁力链接）
+        assert_eq!(exported[0].urls, vec![magnet.clone()]);
+
+        save_checkpoint(&dir, &repo).expect("保存 checkpoint 应成功");
+        let loaded = load_checkpoint(&dir);
+        assert_eq!(loaded.len(), 2);
+
+        // 恢复进全新仓库：BT 字段保真
+        let mut repo2 = TaskRepository::new();
+        restore_checkpoint(&mut repo2, loaded);
+        assert_eq!(repo2.all().len(), 2);
+
+        // 未完成任务：Waiting 恢复、bitfield / info_hash / 源保真
+        let r1 = repo2.get("bt00000000000001").expect("BT 任务应恢复");
+        assert_eq!(r1.status, TaskStatus::Waiting);
+        assert_eq!(r1.total_length, 1000);
+        assert_eq!(r1.completed_length, 400);
+        assert_eq!(r1.bitfield, "05f");
+        assert_eq!(r1.created_at, 111);
+        assert!(r1.bittorrent.is_some(), "BT 任务应重建 bittorrent 信息");
+        assert_eq!(
+            r1.bittorrent.as_ref().unwrap().info_hash.as_deref(),
+            Some(info_hash)
+        );
+        // 磁力 metadata 阶段：info_name=None（前端 isMagnetTask）
+        assert!(r1.bittorrent.as_ref().unwrap().info_name.is_none());
+        // 源保留在 files[0].uris[0]（resume 时重新加入引擎取源）
+        assert_eq!(r1.files[0].uris[0].0, magnet);
+
+        // 做种任务：Seeding 保持
+        let r2 = repo2.get("bt00000000000002").expect("做种任务应恢复");
+        assert_eq!(r2.status, TaskStatus::Seeding);
+
+        // 向后兼容：旧 checkpoint（无 is_bt 等键）应正常解析为 HTTP 任务语义
+        let legacy = r#"[
+            {"gid":"aaaaaaaaaaaaaaaa","status":"waiting","dir":"/d","urls":["https://a/x"],
+             "out":"x.bin","total_length":10,"completed_length":5,
+             "error_message":null,"created_at":1}
+        ]"#;
+        fs::write(dir.join("checkpoint.json"), legacy).unwrap();
+        let loaded_legacy = load_checkpoint(&dir);
+        assert_eq!(loaded_legacy.len(), 1);
+        assert!(!loaded_legacy[0].is_bt, "旧 checkpoint 默认非 BT 任务");
+        let mut repo3 = TaskRepository::new();
+        restore_checkpoint(&mut repo3, loaded_legacy);
+        let r3 = repo3.get("aaaaaaaaaaaaaaaa").expect("旧 checkpoint 任务应恢复");
+        assert!(r3.bittorrent.is_none(), "旧 checkpoint 任务应为 HTTP 语义");
 
         cleanup(&dir);
     }

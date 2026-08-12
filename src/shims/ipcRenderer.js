@@ -12,6 +12,19 @@ import { listen, emit } from '@tauri-apps/api/event'
 // channel -> Array<{ listener, unlisten }>
 const unlistenRegistry = new Map()
 
+// ArrayBuffer / TypedArray 无法被 Tauri emit 正确序列化（JSON.stringify 后为空对象），
+// 这里在发送前自动转换为普通字节数组，保证二进制载荷（如托盘图标）可传输；
+// 结构化尺寸信息由调用方（main.js updateTray）随载荷提供
+const toSerializable = (arg) => {
+  if (arg instanceof ArrayBuffer) {
+    return Array.from(new Uint8Array(arg))
+  }
+  if (ArrayBuffer.isView(arg)) {
+    return Array.from(new Uint8Array(arg.buffer, arg.byteOffset, arg.byteLength))
+  }
+  return arg
+}
+
 const register = (channel, listener, unlisten) => {
   const list = unlistenRegistry.get(channel) || []
   list.push({ listener, unlisten })
@@ -20,6 +33,7 @@ const register = (channel, listener, unlisten) => {
 
 export const ipcRenderer = {
   send (channel, ...args) {
+    args = args.map(toSerializable)
     if (channel === 'command') {
       const [command, ...rest] = args
       return emit('command', { command, args: rest })

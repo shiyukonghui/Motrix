@@ -31,10 +31,11 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::bt::{BtAddOptions, BtEngine, BtEngineConfig, BtEvent, BtProgress, TorrentMeta};
 use crate::config::{ConfigManager, SystemConfig};
 use crate::kget::{self, KgetEvent, KgetHandle};
 use crate::options::{parse_size, EngineOptions};
-use crate::task::{generate_gid, GlobalStat, Task, TaskRepository, TaskStatus};
+use crate::task::{generate_gid, GlobalStat, Task, TaskFile, TaskRepository, TaskStatus};
 
 /// 任务状态变化事件（engine:task-event 载荷来源，Task 11）
 ///
@@ -76,6 +77,18 @@ pub struct TaskManager {
     speed_samples: Mutex<HashMap<String, (u64, std::time::Instant)>>,
     /// 最大并发下载数（对应 max-concurrent-downloads，最小 1）
     max_concurrent: Mutex<u32>,
+    /// BT 引擎（Phase 3，librqbit 集成）：**懒初始化**（首次 add_torrent 时创建，
+    /// 避免应用无 BT 任务时也拉起 DHT / 监听端口）；内部自持 tokio Runtime 与
+    /// librqbit Session，进度经轮询回调 `on_bt_event` 回到本管理器
+    bt: Mutex<Option<Arc<BtEngine>>>,
+    /// 运行中 BT 任务 gid 集合（并发槽位计数用：`active.len() + bt_active.len()`
+    /// 为实际运行数；暂停 / 移除 / 下载完成（不做种）时移除）
+    bt_active: Mutex<std::collections::HashSet<String>>,
+    /// 已发过"下载完成"通知的 BT 任务 gid（防止轮询重复触发 complete / bt-complete）
+    bt_done: Mutex<std::collections::HashSet<String>>,
+    /// BT 任务进入做种的时刻（gid → Instant；做种上限 seed-time / seed-ratio 检查用；
+    /// 做种结束 / 暂停 / 移除时清理对应记录，避免内存泄漏与过期时刻误判）
+    bt_seed_started: Mutex<HashMap<String, std::time::Instant>>,
     /// 自引用（Weak）：引擎线程回调需要升级为 Arc<TaskManager> 再调用方法
     self_arc: Mutex<Option<Weak<TaskManager>>>,
     /// 任务状态变化事件通道（tokio broadcast：send 不 await，同步上下文可直接发送；
@@ -106,6 +119,11 @@ impl TaskManager {
             task_options: Mutex::new(HashMap::new()),
             speed_samples: Mutex::new(HashMap::new()),
             max_concurrent: Mutex::new(max_concurrent),
+            // BT 引擎懒初始化（None），首次 add_torrent 时创建
+            bt: Mutex::new(None),
+            bt_active: Mutex::new(std::collections::HashSet::new()),
+            bt_done: Mutex::new(std::collections::HashSet::new()),
+            bt_seed_started: Mutex::new(HashMap::new()),
             self_arc: Mutex::new(None),
             events,
         }
@@ -233,8 +251,68 @@ impl TaskManager {
         self.pause_inner(gid)
     }
 
+    /// BT 任务暂停（pause / force_pause 的 BT 分支）
+    ///
+    /// 暂停语义（项目已确认）：**停止 torrent 并保留 piece 状态**（librqbit
+    /// session.pause），恢复时重新 start 基于已有 piece 续传，不重新校验。
+    /// - Active / Waiting → Paused：引擎 pause + 从 bt_active 移除（释放并发槽位）；
+    /// - 已暂停任务幂等；终态（complete/error/seeding）不可暂停（做种任务的
+    ///   终止走 remove，与 aria2 语义一致）。
+    fn pause_bt(&self, gid: &str) -> Result<String, String> {
+        // 1. 停止引擎（仅当任务已登记进 librqbit Session；checkpoint 恢复后未
+        //    resume 的任务不在引擎中，跳过引擎操作直接状态迁移）
+        if let Ok(guard) = self.bt.lock() {
+            if let Some(engine) = guard.as_ref() {
+                if engine.contains(gid) {
+                    engine.pause(gid)?;
+                }
+            }
+        }
+        // 2. 状态迁移：active / waiting → paused；paused 幂等
+        {
+            let mut repo = self
+                .repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?;
+            let status = repo
+                .get(gid)
+                .map(|t| t.status)
+                .ok_or_else(|| format!("任务不存在: {gid}"))?;
+            match status {
+                TaskStatus::Active | TaskStatus::Waiting => {
+                    repo.set_status(gid, TaskStatus::Paused)
+                        .map_err(|_| format!("任务不存在: {gid}"))?;
+                    self.emit_event(gid, "pause");
+                }
+                // 已暂停：幂等
+                TaskStatus::Paused => {}
+                // 终态任务不可暂停（含做种中任务：做种终止走 remove）
+                _ => return Err(format!("无法暂停任务（当前状态不支持）: gid={gid}")),
+            }
+        }
+        // 3. 释放并发槽位（暂停可能唤醒下一个等待任务）
+        if let Ok(mut active) = self.bt_active.lock() {
+            active.remove(gid);
+        }
+        // 4. 清理做种起始时刻记录（暂停后做种计时作废，恢复重新开始）
+        if let Ok(mut started) = self.bt_seed_started.lock() {
+            started.remove(gid);
+        }
+        self.promote_waiting();
+        Ok("OK".to_string())
+    }
+
     /// pause / force_pause 共用实现
     fn pause_inner(&self, gid: &str) -> Result<String, String> {
+        // 0. BT 任务分流（Phase 3）：停止 librqbit torrent 并保留 piece 状态
+        let is_bt = self
+            .repo
+            .lock()
+            .map(|repo| repo.get(gid).map(|t| t.bittorrent.is_some()).unwrap_or(false))
+            .unwrap_or(false);
+        if is_bt {
+            return self.pause_bt(gid);
+        }
         // 1. abort 并"有限等待"引擎线程退出（KGet 引擎可能阻塞在网络读取，
         //    不能无限 join（reqwest 内部超时 300s）；超时后直接继续，
         //    引擎线程稍后自行退出，迟到的 Finished/Failed 事件因状态已变会被忽略）
@@ -349,6 +427,15 @@ impl TaskManager {
             // 终态任务不可恢复
             _ => return Err(format!("无法恢复任务（当前状态不支持）: gid={gid}")),
         }
+        // 1.5 BT 任务分流（Phase 3）：重新 start（librqbit unpause，基于保留 piece 续传）
+        let is_bt = self
+            .repo
+            .lock()
+            .map(|repo| repo.get(gid).map(|t| t.bittorrent.is_some()).unwrap_or(false))
+            .unwrap_or(false);
+        if is_bt {
+            return self.resume_bt(gid);
+        }
         // 2. 检查并发槽位：满则回到 waiting 队列（等待其它任务完成后自动 promote）
         let max = *self
             .max_concurrent
@@ -387,11 +474,83 @@ impl TaskManager {
         Ok("OK".to_string())
     }
 
+    /// BT 任务恢复（resume 的 BT 分支）
+    ///
+    /// - checkpoint 恢复的任务不在 librqbit Session 中：先经
+    ///   [`TaskManager::ensure_bt_registered`] 从 `files[0].uris[0]` 的源重新加入
+    ///   （磁力 / base64 .torrent），再 unpause 续传；
+    /// - 常规暂停后恢复：引擎中已有登记，直接 unpause（librqbit 基于保留的
+    ///   piece 状态继续下载 / 做种）。
+    fn resume_bt(&self, gid: &str) -> Result<String, String> {
+        // 1. 并发槽位检查：满则回到 waiting 队列
+        let max = *self
+            .max_concurrent
+            .lock()
+            .map_err(|e| format!("获取并发配置锁失败: {e}"))?;
+        let num_active = self
+            .active
+            .lock()
+            .map_err(|e| format!("获取运行集合锁失败: {e}"))?
+            .len()
+            + self
+                .bt_active
+                .lock()
+                .map_err(|e| format!("获取 BT 运行集合锁失败: {e}"))?
+                .len();
+        if num_active >= max as usize {
+            let mut repo = self
+                .repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?;
+            repo.set_status(gid, TaskStatus::Waiting)
+                .map_err(|_| format!("任务不存在: {gid}"))?;
+            return Ok("OK".to_string());
+        }
+        // 2. 置 Active 并确保引擎登记 + 恢复运行
+        {
+            let mut repo = self
+                .repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?;
+            repo.set_status(gid, TaskStatus::Active)
+                .map_err(|_| format!("任务不存在: {gid}"))?;
+        }
+        let engine = self
+            .bt
+            .lock()
+            .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?
+            .clone()
+            .ok_or_else(|| "BT 引擎未初始化".to_string())?;
+        // checkpoint 恢复的任务：重新加入引擎（已登记则 no-op）；
+        // 重新加入的任务在 librqbit 中已自动运行（live），对 live torrent 调
+        // unpause 会报错（librqbit "already live"），故仅在"暂停后恢复"场景 unpause。
+        let was_registered = engine.contains(gid);
+        self.ensure_bt_registered(gid)?;
+        if was_registered {
+            engine.resume(gid)?;
+        }
+        // 3. 登记运行集合 + 下载开始事件（与 KGet resume 对齐）
+        if let Ok(mut active) = self.bt_active.lock() {
+            active.insert(gid.to_string());
+        }
+        self.emit_event(gid, "start");
+        Ok("OK".to_string())
+    }
+
     /// 移除任务（aria2.remove / forceRemove）：abort 引擎句柄 + 移除仓库记录
     ///
     /// 已下载的部分文件保留（是否删除文件由上层决定）；移除后释放并发槽位，
     /// 自动 promote 下一个等待任务。任务不存在返回错误。
     pub fn remove(&self, gid: &str) -> Result<String, String> {
+        // 0. BT 任务分流（Phase 3）：librqbit session.delete（保留已下载文件）
+        let is_bt = self
+            .repo
+            .lock()
+            .map(|repo| repo.get(gid).map(|t| t.bittorrent.is_some()).unwrap_or(false))
+            .unwrap_or(false);
+        if is_bt {
+            return self.remove_bt(gid);
+        }
         // 1. abort 并"有限等待"引擎线程退出（避免移除后引擎仍在写文件；
         //    卡在网络读取时超时后继续，线程稍后自行退出）
         if let Some(handle) = self
@@ -433,22 +592,97 @@ impl TaskManager {
         Ok("OK".to_string())
     }
 
+    /// BT 任务移除（remove / forceRemove 的 BT 分支）
+    ///
+    /// librqbit session.delete（`delete_files=false`）**保留已下载文件**
+    /// （与 aria2 remove 语义一致；是否删除文件由上层决定）；从引擎登记表与
+    /// 任务仓库移除，释放并发槽位后唤醒下一个等待任务。
+    fn remove_bt(&self, gid: &str) -> Result<String, String> {
+        // 1. 从引擎移除（仅当已登记；checkpoint 恢复后未 resume 的任务跳过）
+        if let Ok(guard) = self.bt.lock() {
+            if let Some(engine) = guard.as_ref() {
+                if engine.contains(gid) {
+                    engine.remove(gid)?;
+                }
+            }
+        }
+        // 2. 清理任务级记录（源 / 选项 / 运行集合 / 完成标记）
+        self.task_uris
+            .lock()
+            .map_err(|e| format!("获取源 URL 表锁失败: {e}"))?
+            .remove(gid);
+        self.task_options
+            .lock()
+            .map_err(|e| format!("获取任务选项锁失败: {e}"))?
+            .remove(gid);
+        if let Ok(mut active) = self.bt_active.lock() {
+            active.remove(gid);
+        }
+        if let Ok(mut done) = self.bt_done.lock() {
+            done.remove(gid);
+        }
+        // 清理做种起始时刻记录（移除任务后做种计时无意义，避免内存泄漏）
+        if let Ok(mut started) = self.bt_seed_started.lock() {
+            started.remove(gid);
+        }
+        // 3. 从仓库移除（进入 removed 历史，供 stopped 列表展示）
+        {
+            let mut repo = self
+                .repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?;
+            if repo.remove(gid).is_none() {
+                return Err(format!("任务不存在: {gid}"));
+            }
+            self.emit_event(gid, "stop");
+        }
+        // 4. 释放并发槽位，唤醒下一个等待任务
+        self.promote_waiting();
+        Ok("OK".to_string())
+    }
+
     /// 修改任务级选项（aria2.changeOption）
     ///
     /// 说明：运行中任务的选项在**下次恢复（resume / 重试）时生效**；
     /// 已暂停任务更新后**不会自动重启**（保持暂停状态），符合 aria2 语义。
+    /// 例外：`select-file`（BT 多文件任务的已选文件集合）**即时下发**到
+    /// librqbit（`update_only_files`），无需重启任务即生效。
     pub fn change_option(&self, gid: &str, options: &Value) -> Result<String, String> {
-        let mut task_options = self
-            .task_options
-            .lock()
-            .map_err(|e| format!("获取任务选项锁失败: {e}"))?;
-        let mut opts = task_options
-            .get(gid)
-            .cloned()
-            .ok_or_else(|| format!("任务不存在: {gid}"))?;
-        // 任务级 options 覆盖（与 add_uri 同一套映射）
-        opts.apply_task_options(options);
-        task_options.insert(gid.to_string(), opts);
+        // 1. 更新任务级选项（与 add_uri 同一套映射；先更新、释放锁后再做 BT 下发，
+        //    避免持 task_options 锁期间嵌套其它锁）
+        let updated = {
+            let mut task_options = self
+                .task_options
+                .lock()
+                .map_err(|e| format!("获取任务选项锁失败: {e}"))?;
+            let mut opts = task_options
+                .get(gid)
+                .cloned()
+                .ok_or_else(|| format!("任务不存在: {gid}"))?;
+            opts.apply_task_options(options);
+            task_options.insert(gid.to_string(), opts.clone());
+            opts
+        };
+        // 2. BT 任务 select-file 即时生效：把解析后的 0 起始索引（apply_task_options
+        //    已转换，见 options.rs parse_select_file）下发给 librqbit 更新已选文件集合
+        if options.get("select-file").is_some() {
+            let is_bt = self
+                .repo
+                .lock()
+                .map(|repo| repo.get(gid).map(|t| t.bittorrent.is_some()).unwrap_or(false))
+                .unwrap_or(false);
+            if is_bt {
+                // 仅下发解析结果；未指定合法索引（空串等）时下发空集合（与选项一致）
+                let indices = updated.only_files.clone().unwrap_or_default();
+                let engine = self
+                    .bt
+                    .lock()
+                    .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?
+                    .clone()
+                    .ok_or_else(|| "BT 引擎未初始化".to_string())?;
+                engine.only_files(gid, &indices)?;
+            }
+        }
         Ok("OK".to_string())
     }
 
@@ -493,10 +727,394 @@ impl TaskManager {
 
     /// 添加 BitTorrent 种子 / 磁力任务（aria2.addTorrent）
     ///
-    /// BT 下载支持属 **Phase 3**（librqbit 集成），本次不创建任务、不启动引擎，
-    /// 明确返回占位错误，避免前端误以为任务已建立。
-    pub fn add_torrent(&self, _torrent: &str, _options: &Value) -> Result<String, String> {
-        Err("BitTorrent 支持将在 Phase 3 提供".to_string())
+    /// `torrent` 为 magnet 链接（`magnet:` 前缀）或 base64 编码的 .torrent 内容：
+    /// - **磁力**：预解析 info_hash 创建"metadata 任务"（`bittorrent` 存在但
+    ///   `info_name=None`、totalLength=0，前端 `isMagnetTask` 据此判断）；
+    ///   metadata 获取成功后轮询回调 [`TaskManager::bt_metadata_ready`] 在同一 gid
+    ///   上补齐文件 / 总长 / announce / 名称；
+    /// - **.torrent**：解码解析后直接创建完整 BT 任务（files / totalLength /
+    ///   announceList / info_name 齐备）。
+    ///
+    /// 任务加入 librqbit Session 即开始运行（受 `max-concurrent-downloads` 并发队列
+    /// 限制：槽位不足时保持 Waiting，promote 时置 Active）。返回 16 位 hex gid。
+    pub fn add_torrent(&self, torrent: &str, options: &Value) -> Result<String, String> {
+        let torrent = torrent.trim();
+        if torrent.is_empty() {
+            return Err("add_torrent 需要一个 magnet 链接或 base64 编码的 .torrent 内容".to_string());
+        }
+        // 1. 任务级选项：全局为基准 + 任务级覆盖（含 bt-tracker / select-file 等 BT 键）
+        let mut task_opts = self
+            .global
+            .lock()
+            .map_err(|e| format!("获取全局选项锁失败: {e}"))?
+            .clone();
+        task_opts.apply_task_options(options);
+        // keep-seeding 未在任务级指定时，取 user.json 的配置（默认关闭）
+        if options.get("keep-seeding").is_none() {
+            if let Ok(cm) = self.config_manager.lock() {
+                task_opts.keep_seeding = cm.user_config().keep_seeding;
+            }
+        }
+        // 2. 组装 BT 添加选项（dir / trackers / select-file）
+        let bt_opts = BtAddOptions {
+            dir: task_opts.dir.clone(),
+            trackers: task_opts.bt_trackers.clone(),
+            only_files: task_opts.only_files.clone(),
+            paused: false,
+        };
+        // 3. 懒创建 BT 引擎（首次 add_torrent 时初始化 librqbit Session）
+        let engine = self.bt_engine(&task_opts)?;
+        // 4. 生成 gid，注册事件回调。**回调捕获 Weak<TaskManager>**：TaskManager
+        //    持有 BtEngine（强引用），若回调再持有 Arc<TaskManager> 会形成循环引用
+        //    导致永不释放；Weak 升级失败（管理器已释放）时静默忽略迟到事件。
+        let gid = generate_gid();
+        let callback = {
+            let weak = self
+                .self_arc
+                .lock()
+                .map_err(|e| format!("获取自引用锁失败: {e}"))?
+                .clone()
+                .ok_or_else(|| "TaskManager 自引用未设置（请先调用 set_self）".to_string())?;
+            let gid = gid.clone();
+            move |ev: BtEvent| {
+                if let Some(this) = weak.upgrade() {
+                    this.on_bt_event(&gid, ev);
+                }
+            }
+        };
+        // 5. 分流：磁力 → metadata 任务；base64 .torrent → 完整任务
+        if torrent.starts_with("magnet:") {
+            let meta = engine.add_magnet(torrent, &bt_opts, &gid, callback)?;
+            // metadata 任务：bittorrent 存在但 info_name=None、totalLength=0
+            let mut task =
+                Task::new_bt_task(&gid, torrent, &task_opts.dir, Some(meta.info_hash.clone()));
+            task.total_length = 0;
+            self.repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?
+                .add(task);
+        } else {
+            // base64 解码 .torrent 内容 → librqbit 解析 → 完整任务
+            let bytes = crate::bt::decode_torrent_base64(torrent)?;
+            let meta = engine.add_torrent_file(&bytes, &bt_opts, &gid, callback)?;
+            let mut task =
+                Task::new_bt_task(&gid, torrent, &task_opts.dir, Some(meta.info_hash.clone()));
+            // 填充完整元信息（files / totalLength / announce / info_name / mode）
+            apply_torrent_meta(&mut task, &meta, task_opts.only_files.as_deref());
+            self.repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?
+                .add(task);
+        }
+        // 6. 登记源 / 任务级选项（恢复与续传取源）
+        self.task_uris
+            .lock()
+            .map_err(|e| format!("获取源 URL 表锁失败: {e}"))?
+            .insert(gid.clone(), vec![torrent.to_string()]);
+        self.task_options
+            .lock()
+            .map_err(|e| format!("获取任务选项锁失败: {e}"))?
+            .insert(gid.clone(), task_opts);
+        // 7. 统一调度：槽位有空则启动最早 Waiting（含刚添加的 BT 任务）
+        self.promote_waiting();
+        Ok(gid)
+    }
+
+    /// 获取 BT 任务 peers（aria2.getPeers 兼容，limit 默认 100 分页；
+    /// 当前 librqbit 8.1.1 未暴露 per-peer 明细，返回空数组，契约保留）
+    pub fn get_peers(&self, gid: &str, limit: usize) -> Vec<crate::bt::PeerInfo> {
+        match self.bt.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(engine) if engine.contains(gid) => engine.get_peers(gid, limit),
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 懒创建（或复用）BT 引擎
+    fn bt_engine(&self, opts: &EngineOptions) -> Result<Arc<BtEngine>, String> {
+        let mut guard = self
+            .bt
+            .lock()
+            .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?;
+        if let Some(engine) = guard.as_ref() {
+            return Ok(engine.clone());
+        }
+        // listen-port 起始的 100 端口范围（避免多实例 / 并行测试端口冲突）
+        let config = BtEngineConfig {
+            listen_port_range: opts.bt_listen_port.map(|p| p..p.saturating_add(100)),
+        };
+        let engine = BtEngine::new(config, opts.dir.clone())?;
+        *guard = Some(engine.clone());
+        Ok(engine)
+    }
+
+    /// 确保 BT 任务已登记进引擎（checkpoint 恢复的任务在重启后未加入 librqbit
+    /// Session，resume / promote 时据此从 `files[0].uris[0]` 的源重新加入续传）
+    fn ensure_bt_registered(&self, gid: &str) -> Result<(), String> {
+        let engine = self
+            .bt
+            .lock()
+            .map_err(|e| format!("获取 BT 引擎锁失败: {e}"))?
+            .clone()
+            .ok_or_else(|| "BT 引擎未初始化".to_string())?;
+        if engine.contains(gid) {
+            return Ok(());
+        }
+        // 从仓库任务 + 任务级选项取源与 BT 选项
+        let (source, bt_opts) = {
+            let repo = self
+                .repo
+                .lock()
+                .map_err(|e| format!("获取任务仓库锁失败: {e}"))?;
+            let task = repo
+                .get(gid)
+                .ok_or_else(|| format!("任务不存在: {gid}"))?;
+            let source = task
+                .files
+                .first()
+                .and_then(|f| f.uris.first())
+                .map(|(uri, _)| uri.clone())
+                .ok_or_else(|| format!("BT 任务 {gid} 缺少源（files 为空）"))?;
+            let opts = self
+                .task_options
+                .lock()
+                .map_err(|e| format!("获取任务选项锁失败: {e}"))?
+                .get(gid)
+                .cloned()
+                .unwrap_or_default();
+            (
+                source,
+                BtAddOptions {
+                    dir: task.dir.clone(),
+                    trackers: opts.bt_trackers.clone(),
+                    only_files: opts.only_files.clone(),
+                    paused: false,
+                },
+            )
+        };
+        let callback = {
+            // 与 add_torrent 一致：捕获 Weak<TaskManager>，避免循环引用
+            let weak = match self.self_arc.lock() {
+                Ok(guard) => guard.clone(),
+                Err(e) => return Err(format!("获取自引用锁失败: {e}")),
+            };
+            let gid = gid.to_string();
+            move |ev: BtEvent| {
+                if let Some(this) = weak.as_ref().and_then(|w| w.upgrade()) {
+                    this.on_bt_event(&gid, ev);
+                }
+            }
+        };
+        if source.starts_with("magnet:") {
+            engine.add_magnet(&source, &bt_opts, gid, callback)?;
+        } else {
+            let bytes = crate::bt::decode_torrent_base64(&source)?;
+            let meta = engine.add_torrent_file(&bytes, &bt_opts, gid, callback)?;
+            // 重新加入时若任务仍处于 metadata 阶段（info_name=None），补齐元信息
+            self.apply_bt_meta_if_pending(gid, &meta);
+        }
+        Ok(())
+    }
+
+    /// BT 引擎事件分发入口（轮询线程内调用，须快速返回）
+    fn on_bt_event(&self, gid: &str, ev: BtEvent) {
+        match ev {
+            BtEvent::MetadataReady(meta) => self.bt_metadata_ready(gid, meta),
+            BtEvent::Progress(progress) => self.bt_update_progress(gid, &progress),
+            // 磁力后台添加失败：标记任务错误（如 magnet 无效 / metadata 解析失败）
+            BtEvent::AddFailed(message) => {
+                if let Ok(mut repo) = self.repo.lock() {
+                    let _ = repo.mark_error(gid, 1, message);
+                }
+                self.emit_event(gid, "error");
+            }
+        }
+    }
+
+    /// 磁力 metadata 就绪：在同一 gid 上补齐完整 BT 元信息
+    ///
+    /// （磁力任务创建时 info_name=None / totalLength=0，前端 isMagnetTask；
+    /// 就绪后填充 files / totalLength / announceList / info_name / mode）
+    fn bt_metadata_ready(&self, gid: &str, meta: TorrentMeta) {
+        // 任务级 only_files（文件选择）一并生效
+        let only_files = self
+            .task_options
+            .lock()
+            .map_err(|e| warn!("[Motrix] metadata 就绪获取任务选项失败: {e}"))
+            .ok()
+            .and_then(|g| g.get(gid).map(|o| o.only_files.clone()))
+            .flatten();
+        let mut repo = match self.repo.lock() {
+            Ok(repo) => repo,
+            Err(e) => {
+                warn!("[Motrix] metadata 就绪获取任务仓库锁失败: {e}");
+                return;
+            }
+        };
+        let Some(mut task) = repo.get(gid).cloned() else { return };
+        apply_torrent_meta(&mut task, &meta, only_files.as_deref());
+        repo.add(task);
+        drop(repo);
+        // metadata 就绪可能让等待中的任务具备启动条件，唤醒调度
+        self.promote_waiting();
+    }
+
+    /// 重新加入引擎时若任务仍处于 metadata 阶段，补齐元信息（ensure_bt_registered 用）
+    fn apply_bt_meta_if_pending(&self, gid: &str, meta: &TorrentMeta) {
+        let only_files = self
+            .task_options
+            .lock()
+            .ok()
+            .and_then(|g| g.get(gid).map(|o| o.only_files.clone()))
+            .flatten();
+        if let Ok(mut repo) = self.repo.lock() {
+            if let Some(mut task) = repo.get(gid).cloned() {
+                // 仅补齐 metadata 阶段的任务（info_name 仍为 None）
+                let pending = task
+                    .bittorrent
+                    .as_ref()
+                    .map(|b| b.info_name.is_none())
+                    .unwrap_or(false);
+                if pending {
+                    apply_torrent_meta(&mut task, meta, only_files.as_deref());
+                    repo.add(task);
+                }
+            }
+        }
+    }
+
+    /// BT 进度回调：更新任务仓库字段 + 处理"下载完成 → Seeding / Complete"状态迁移
+    ///
+    /// - 下载完成（`progress.finished` 首次为 true）：
+    ///   - `keep-seeding` 开启 → Seeding（保留做种，速度 / peers 继续上报）；
+    ///   - 否则 → Complete，并连发 `complete`（下载完成）+ `bt-complete`（做种结束，
+    ///     下载完成即做种结束）；
+    /// - 做种中任务由用户暂停 / 移除终止（pause 对 Seeding 状态返回错误，见 pause_inner）。
+    pub fn bt_update_progress(&self, gid: &str, p: &BtProgress) {
+        let keep_seeding = self
+            .task_options
+            .lock()
+            .map_err(|e| warn!("[Motrix] BT 进度回调获取任务选项失败: {e}"))
+            .ok()
+            .and_then(|g| g.get(gid).map(|o| o.keep_seeding))
+            .unwrap_or(false);
+        let mut repo = match self.repo.lock() {
+            Ok(repo) => repo,
+            Err(e) => {
+                warn!("[Motrix] BT 进度回调获取任务仓库锁失败: {e}");
+                return;
+            }
+        };
+        let Some(task) = repo.get(gid) else { return };
+        // 已暂停 / 已移除 / 已出错任务忽略迟到的进度事件
+        if !matches!(
+            task.status,
+            TaskStatus::Active | TaskStatus::Waiting | TaskStatus::Seeding
+        ) {
+            return;
+        }
+        // 进度 / 速度 / 做种字段
+        let _ = repo.update_progress(
+            gid,
+            p.completed,
+            p.total,
+            p.download_speed,
+            p.upload_speed,
+            // connections：librqbit 无连接数概念，用 live peers 数近似
+            p.num_seeders,
+        );
+        if let Some(task) = repo.get_mut(gid) {
+            task.upload_length = p.uploaded_bytes;
+            task.num_seeders = p.num_seeders;
+            task.seeder = p.seeder;
+            task.bitfield = p.bitfield.clone();
+        }
+        // 文件级进度同步（librqbit stats.file_progress 与文件列表一一对应）
+        if let Some(task) = repo.get_mut(gid) {
+            if task.files.len() == p.file_progress.len() {
+                for (f, done) in task.files.iter_mut().zip(&p.file_progress) {
+                    f.completed_length = *done;
+                    f.length = f.length.max(*done);
+                }
+            }
+        }
+        // 做种上限检查：keep-seeding 进入做种后，每轮 500ms 回调都会走到这里；
+        // 满足 seed-time（做种时长）/ seed-ratio（上传 / 下载比率）任一上限即结束
+        // 做种（置 Complete + bt-complete + 释放并发槽位），随后由用户暂停 / 移除
+        // 终止的语义不再需要（spec：达到上限自动触发 bt-complete）
+        let is_seeding = repo
+            .get(gid)
+            .map(|t| t.status == TaskStatus::Seeding)
+            .unwrap_or(false);
+        if is_seeding {
+            // 读取做种上限配置（缺省视为不限；与 task_options 短锁交互，读后即释放）
+            let (seed_ratio, seed_time) = self
+                .task_options
+                .lock()
+                .map_err(|e| warn!("[Motrix] BT 进度回调获取任务选项失败: {e}"))
+                .ok()
+                .and_then(|g| g.get(gid).map(|o| (o.seed_ratio, o.seed_time)))
+                .unwrap_or((None, None));
+            // 做种起始时刻：无记录（异常路径）视为刚进入做种，elapsed=0 不误判
+            let elapsed_secs = self
+                .bt_seed_started
+                .lock()
+                .ok()
+                .and_then(|m| m.get(gid).copied())
+                .map(|start| start.elapsed().as_secs())
+                .unwrap_or(0);
+            if seeding_limit_reached(seed_ratio, seed_time, p.uploaded_bytes, p.total, elapsed_secs) {
+                // 结束做种：置 Complete + bt-complete 事件 + 从运行集合移除（释放并发槽位）
+                let _ = repo.set_status(gid, TaskStatus::Complete);
+                self.emit_event(gid, "bt-complete");
+                if let Ok(mut active) = self.bt_active.lock() {
+                    active.remove(gid);
+                }
+                // 清理做种起始时刻（避免内存泄漏与后续过期时刻误判）
+                if let Ok(mut started) = self.bt_seed_started.lock() {
+                    started.remove(gid);
+                }
+                drop(repo);
+                self.promote_waiting();
+                return;
+            }
+        }
+        // 下载完成 → 状态迁移（只触发一次）
+        let already_done = self
+            .bt_done
+            .lock()
+            .map(|g| g.contains(gid))
+            .unwrap_or(true);
+        if p.finished && !already_done {
+            if keep_seeding {
+                // 进入做种：保留并发槽位（继续上传），通知"下载完成"；
+                // 记录做种起始时刻（seed-time / seed-ratio 上限检查用；
+                // or_insert 保证重复回调不重置已注入的时刻）
+                let _ = repo.set_status(gid, TaskStatus::Seeding);
+                if let Ok(mut started) = self.bt_seed_started.lock() {
+                    started
+                        .entry(gid.to_string())
+                        .or_insert_with(std::time::Instant::now);
+                }
+                self.emit_event(gid, "complete");
+            } else {
+                // 不做种：直接完成，下载完成即做种结束（bt-complete）
+                let _ = repo.set_status(gid, TaskStatus::Complete);
+                self.emit_event(gid, "complete");
+                self.emit_event(gid, "bt-complete");
+                // 释放并发槽位（唤醒下一个等待任务）
+                if let Ok(mut active) = self.bt_active.lock() {
+                    active.remove(gid);
+                }
+                drop(repo);
+                self.promote_waiting();
+            }
+            if let Ok(mut done) = self.bt_done.lock() {
+                done.insert(gid.to_string());
+            }
+        }
     }
 
     /// 按 gid 查询任务（克隆返回，避免调用方持锁）
@@ -555,7 +1173,15 @@ impl TaskManager {
                     return;
                 }
             };
-            if num_active >= max.max(1) as usize {
+            // BT 任务同样占用并发槽位（active 为 KGet 句柄、bt_active 为 BT 任务集合）
+            let num_bt_active = match self.bt_active.lock() {
+                Ok(guard) => guard.len(),
+                Err(e) => {
+                    warn!("[Motrix] promote_waiting 获取 BT 运行集合锁失败: {e}");
+                    return;
+                }
+            };
+            if num_active + num_bt_active >= max.max(1) as usize {
                 return;
             }
             // 2. 取最早 Waiting 任务
@@ -585,7 +1211,35 @@ impl TaskManager {
                 }
             }
             // 4. 启动引擎；失败则标记 Error 并继续尝试下一个等待任务
-            if let Err(e) = self.spawn_one(&gid) {
+            //    （BT 任务：确保已登记进 librqbit Session 后即视为已启动；
+            //    HTTP 任务：KGet spawn）
+            let is_bt = {
+                let repo = match self.repo.lock() {
+                    Ok(repo) => repo,
+                    Err(e) => {
+                        warn!("[Motrix] promote_waiting 获取任务仓库锁失败: {e}");
+                        return;
+                    }
+                };
+                repo.get(&gid)
+                    .map(|t| t.bittorrent.is_some())
+                    .unwrap_or(false)
+            };
+            if is_bt {
+                // BT 任务启动 = 登记运行集合（librqbit 在 add_torrent / ensure_bt_registered
+                // 时已开始下载；checkpoint 恢复的任务在此补登记）
+                if let Err(e) = self.ensure_bt_registered(&gid) {
+                    if let Ok(mut repo) = self.repo.lock() {
+                        let _ = repo.mark_error(&gid, 1, e);
+                    }
+                    continue;
+                }
+                if let Ok(mut active) = self.bt_active.lock() {
+                    active.insert(gid.clone());
+                }
+                // Task 11：下载开始事件（与 KGet spawn_one 对齐）
+                self.emit_event(&gid, "start");
+            } else if let Err(e) = self.spawn_one(&gid) {
                 if let Ok(mut repo) = self.repo.lock() {
                     let _ = repo.mark_error(&gid, 1, e);
                 }
@@ -864,6 +1518,34 @@ impl TaskManager {
 // 辅助函数
 // ======================================================================
 
+/// 判定 BT 做种上限是否已达到（seed-ratio / seed-time 任一满足即视为达到）
+///
+/// - `seed_time`：做种时长上限（秒），`None` 表示不限时；
+/// - `seed_ratio`：做种比率上限（上传 / 下载，如 2.0 = 上传达下载量的 200%），
+///   `None` 表示不限比；`total == 0` 时比率无法计算，跳过该判定项；
+/// - 两者均未设置 → 恒为 `false`（keep-seeding 下无限做种，由用户暂停 / 移除终止）。
+fn seeding_limit_reached(
+    seed_ratio: Option<f64>,
+    seed_time: Option<u32>,
+    uploaded: u64,
+    total: u64,
+    elapsed_secs: u64,
+) -> bool {
+    // 做种时长达到上限（elapsed_secs 为已做种秒数）
+    if let Some(t) = seed_time {
+        if elapsed_secs >= t as u64 {
+            return true;
+        }
+    }
+    // 做种比率达到上限（total > 0 才可计算；total == 0 跳过此项）
+    if let Some(r) = seed_ratio {
+        if total > 0 && (uploaded as f64 / total as f64) >= r {
+            return true;
+        }
+    }
+    false
+}
+
 /// 解析任务完成时的 (completed, total) 字节数（handle_finished 回填用）
 ///
 /// - `total_length > 0`：直接返回 `(total, total)`（完成时已下载字节 = 总长）；
@@ -882,6 +1564,64 @@ fn resolve_finished_bytes(task: &Task) -> (u64, u64) {
         .map(|m| m.len())
         .unwrap_or(0);
     (size, size)
+}
+
+/// 把种子元信息应用到任务（add_torrent / metadata 就绪回调共用，Phase 3）
+///
+/// 填充：`bittorrent`（info_name / mode / announce_list / info_hash）、
+/// `totalLength`、`files`（绝对路径 = dir + 相对路径，`selected` 按 select-file；
+/// 多文件任务 files[].completedLength 由进度回调同步）。**保留源**
+/// （add_torrent 时写入 `files[0].uris[0]`）供 checkpoint 恢复 / 续传取源。
+fn apply_torrent_meta(task: &mut Task, meta: &TorrentMeta, only_files: Option<&[usize]>) {
+    task.total_length = meta.total_length;
+    if let Some(bt) = task.bittorrent.as_mut() {
+        bt.info_name = meta.name.clone();
+        bt.mode = meta.mode.clone();
+        // announce_list：aria2 为二维数组（每层为同源 tracker 组），平铺后单元素组
+        bt.announce_list = meta.announce_list.iter().map(|t| vec![t.clone()]).collect();
+        bt.info_hash = Some(meta.info_hash.clone());
+    }
+    // 保留源（metadata 就绪重建 files 时不能丢）
+    let source = task
+        .files
+        .first()
+        .and_then(|f| f.uris.first())
+        .map(|(uri, status)| (uri.clone(), status.clone()));
+    // 选中列表：select-file 未指定 → 全选
+    let selected: Vec<bool> = match only_files {
+        Some(indices) => (0..meta.files.len()).map(|i| indices.contains(&i)).collect(),
+        None => vec![true; meta.files.len()],
+    };
+    task.files = meta
+        .files
+        .iter()
+        .zip(selected)
+        .map(|(f, sel)| TaskFile {
+            // TaskFile.index 为 u32（aria2 惯例），TorrentFileMeta.index 为 usize
+            index: f.index as u32,
+            path: join_save_path(&task.dir, &f.path),
+            length: f.length,
+            completed_length: 0,
+            selected: sel,
+            uris: Vec::new(),
+        })
+        .collect();
+    // 源写回 files[0].uris（BT 任务的文件列表以 metadata 为准，源仅用于恢复取源）
+    if let Some((uri, status)) = source {
+        if let Some(first) = task.files.first_mut() {
+            first.uris.push((uri, status));
+        }
+    }
+}
+
+/// 拼接保存目录与种子内相对路径（`dir + "/" + rel`，兼容 dir 尾部分隔符）
+fn join_save_path(dir: &str, rel: &str) -> String {
+    let dir = dir.trim_end_matches(['/', '\\']);
+    if dir.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{dir}/{rel}")
+    }
 }
 
 /// 从 URL 提取保存文件名（`scheme://` 之后路径部分的最后一个 '/' 之后内容），
@@ -1408,35 +2148,63 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 测试 7：add_torrent 占位错误 / get 查询 / purge 清空 removed 历史
+    // 测试 7：add_torrent 真实实现（BT 任务创建 + metadata 阶段字段）/ get 查询 /
+    //         purge 清空 removed 历史
     // ------------------------------------------------------------------
     #[test]
-    fn add_torrent_is_placeholder_and_purge_clears_removed() {
+    fn add_torrent_creates_bt_task_and_purge_clears_removed() {
         let (tm, repo, _temp) = test_manager(1);
-        // add_torrent：BT 属 Phase 3，返回明确占位错误，不创建任务、不启动引擎
-        let err = tm
-            .add_torrent("magnet:?xt=urn:btih:0123456789abcdef", &json!({}))
-            .expect_err("add_torrent 应返回占位错误");
-        assert!(err.contains("Phase 3"), "占位错误信息应提及 Phase 3: {err}");
+        // add_torrent：真实实现（magnet → metadata 任务，引擎懒初始化 librqbit Session）
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        let gid = tm
+            .add_torrent(magnet, &json!({}))
+            .expect("add_torrent 应创建 BT 任务");
+        // gid 为 16 位小写 hex（与 aria2 一致）
+        assert_eq!(gid.len(), 16);
         assert!(
-            repo.lock().unwrap().all().is_empty(),
-            "add_torrent 不应创建任务"
+            gid.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "gid 应为小写 hex: {gid}"
         );
+
+        // 任务存在于仓库：bittorrent 已填充、处于磁力 metadata 阶段（info_name=None）
+        let task = repo
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .expect("BT 任务应存在于仓库")
+            .clone();
+        let bt = task.bittorrent.as_ref().expect("BT 任务应带 bittorrent 信息");
+        assert_eq!(
+            bt.info_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(
+            bt.info_name.is_none(),
+            "磁力 metadata 阶段 info_name 应为 None（前端 isMagnetTask 依赖）"
+        );
+        // totalLength=0（metadata 未就绪），源已写入 files[0].uris[0]
+        assert_eq!(task.total_length, 0);
+        assert_eq!(task.files[0].uris[0].0, magnet);
+        // 再次添加同一磁力：返回新 gid（引擎去重由 librqbit 处理，任务各自独立）
+        let gid3 = tm
+            .add_torrent(magnet, &json!({}))
+            .expect("再次添加磁力应成功");
+        assert_ne!(gid3, gid, "每次 add_torrent 应生成不同 gid");
 
         // get：不存在返回 None；存在返回任务克隆
         assert!(tm.get("0123456789abcdef").is_none());
-        let gid = "abcdef0123456789";
-        let task = Task::new_http_task(gid, &["http://127.0.0.1:1/x".to_string()], "/tmp", "x.bin");
+        let gid2 = "abcdef0123456789";
+        let task = Task::new_http_task(gid2, &["http://127.0.0.1:1/x".to_string()], "/tmp", "x.bin");
         repo.lock().unwrap().add(task);
-        assert_eq!(tm.get(gid).unwrap().gid, gid);
+        assert_eq!(tm.get(gid2).unwrap().gid, gid2);
 
         // purge：仅清空 removed 历史（stopped 列表），在册任务不受影响
-        repo.lock().unwrap().remove(gid);
+        repo.lock().unwrap().remove(gid2);
         assert!(!repo.lock().unwrap().stopped().is_empty());
         tm.purge();
         assert!(repo.lock().unwrap().stopped().is_empty());
-        // 在册任务（active/waiting 等）不受 purge 影响——上面已移除，此处仓库应为空
-        assert!(repo.lock().unwrap().all().is_empty());
+        // 在册任务（BT 任务）不受 purge 影响
+        assert!(repo.lock().unwrap().contains(&gid));
     }
 
     // ------------------------------------------------------------------
@@ -1543,5 +2311,284 @@ mod tests {
             0,
             "完成后下载速度应归零"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 10：change_option 的 select-file 即时下发（Phase 3 修复 1）
+    // ------------------------------------------------------------------
+
+    /// 便捷构造一个带 bittorrent 元信息的 BT 任务并注入仓库 + task_options
+    fn inject_bt_task(tm: &Arc<TaskManager>, gid: &str) {
+        let task = Task::new_bt_task(
+            gid,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "/tmp/dl",
+            Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        );
+        tm.repo.lock().unwrap().add(task);
+        tm.task_options
+            .lock()
+            .unwrap()
+            .insert(gid.to_string(), EngineOptions::default());
+    }
+
+    /// 便捷构造 Seeding 状态 BT 任务（keep-seeding 开启，做种上限可配置）
+    fn inject_seeding_task(
+        tm: &Arc<TaskManager>,
+        gid: &str,
+        seed_ratio: Option<f64>,
+        seed_time: Option<u32>,
+        started_secs_ago: u64,
+        total: u64,
+        uploaded: u64,
+    ) {
+        let mut task = Task::new_bt_task(
+            gid,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "/tmp/dl",
+            Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        );
+        task.status = TaskStatus::Seeding;
+        task.total_length = total;
+        task.completed_length = total;
+        tm.repo.lock().unwrap().add(task);
+        let mut opts = EngineOptions::default();
+        opts.keep_seeding = true;
+        opts.seed_ratio = seed_ratio;
+        opts.seed_time = seed_time;
+        tm.task_options.lock().unwrap().insert(gid.to_string(), opts);
+        // 做种起始时刻注入为 started_secs_ago 秒前（模拟已做种一段时间）
+        tm.bt_seed_started
+            .lock()
+            .unwrap()
+            .insert(gid.to_string(), Instant::now() - Duration::from_secs(started_secs_ago));
+        // 模拟运行中任务（占用并发槽位）与已发过"下载完成"通知
+        tm.bt_active.lock().unwrap().insert(gid.to_string());
+        tm.bt_done.lock().unwrap().insert(gid.to_string());
+    }
+
+    /// 便捷构造一轮做种中的进度回调（finished=true）
+    fn seeding_progress(total: u64, uploaded: u64) -> BtProgress {
+        BtProgress {
+            completed: total,
+            total,
+            uploaded_bytes: uploaded,
+            download_speed: 0,
+            upload_speed: 0,
+            num_seeders: 1,
+            seeder: true,
+            bitfield: String::new(),
+            file_progress: vec![total],
+            finished: true,
+        }
+    }
+
+    #[test]
+    fn change_option_select_file_dispatches_to_bt() {
+        let (tm, _repo, _temp) = test_manager(1);
+        let gid = "0123456789abcdef".to_string();
+        inject_bt_task(&tm, &gid);
+
+        // BT 任务 + select-file：先更新 task_options，再尝试下发引擎。
+        // 引擎未初始化（测试环境不拉起 librqbit）→ 返回明确错误，而非静默忽略。
+        let err = tm
+            .change_option(&gid, &json!({"select-file": "1,3"}))
+            .expect_err("BT 引擎未初始化时 select-file 下发应返回错误");
+        assert!(
+            err.contains("BT 引擎未初始化"),
+            "错误信息应提示引擎未初始化: {err}"
+        );
+        // 但 task_options 已更新：select-file 1 起始索引 → 0 起始（1→0、3→2）
+        let opts = tm.task_options.lock().unwrap();
+        assert_eq!(
+            opts.get(&gid).unwrap().only_files,
+            Some(vec![0, 2]),
+            "select-file 的 1 起始索引应转换为 0 起始存入 task_options"
+        );
+    }
+
+    #[test]
+    fn change_option_select_file_ignored_for_http() {
+        let (tm, repo, _temp) = test_manager(1);
+        // 注入 HTTP 任务（离线：不经过 add_uri 的真实引擎启动）
+        let gid = "fedcba9876543210".to_string();
+        let task = Task::new_http_task(
+            gid.clone(),
+            &["http://127.0.0.1:9/x".to_string()],
+            "/tmp",
+            "x.bin",
+        );
+        repo.lock().unwrap().add(task);
+        tm.task_options
+            .lock()
+            .unwrap()
+            .insert(gid.clone(), EngineOptions::default());
+
+        // 非 BT 任务：select-file 只更新 task_options，不触发引擎下发（返回 OK）
+        tm.change_option(&gid, &json!({"select-file": "1,2"}))
+            .expect("非 BT 任务应忽略 select-file 下发并返回 OK");
+        let opts = tm.task_options.lock().unwrap();
+        assert_eq!(
+            opts.get(&gid).unwrap().only_files,
+            Some(vec![0, 1]),
+            "HTTP 任务的 select-file 也应解析并存入 task_options"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 11：seeding_limit_reached 纯函数（做种上限判定）
+    // ------------------------------------------------------------------
+    #[test]
+    fn seeding_limit_reached_pure_logic() {
+        // 未设置任何上限 → 恒 false（keep-seeding 无限做种）
+        assert!(!seeding_limit_reached(None, None, 999, 1000, 99999));
+        // seed-time 上限：elapsed >= seed_time 秒即满足
+        assert!(!seeding_limit_reached(None, Some(10), 0, 1000, 9));
+        assert!(seeding_limit_reached(None, Some(10), 0, 1000, 10));
+        assert!(seeding_limit_reached(None, Some(10), 0, 1000, 11));
+        // seed-ratio 上限：uploaded / total >= ratio（total > 0 才计算）
+        assert!(!seeding_limit_reached(Some(2.0), None, 1999, 1000, 0));
+        assert!(seeding_limit_reached(Some(2.0), None, 2000, 1000, 0));
+        assert!(seeding_limit_reached(Some(2.0), None, 3000, 1000, 0));
+        // total == 0：跳过 seed-ratio 项（仅 seed-time 生效）
+        assert!(!seeding_limit_reached(Some(2.0), None, 999, 0, 0));
+        assert!(!seeding_limit_reached(Some(2.0), None, 999, 0, 5));
+        assert!(seeding_limit_reached(Some(2.0), Some(5), 999, 0, 5));
+        // 任一满足即达到（ratio 已超、time 未到）
+        assert!(seeding_limit_reached(Some(1.5), Some(999), 1500, 1000, 1));
+        assert!(seeding_limit_reached(Some(999.0), Some(60), 0, 1000, 60));
+    }
+
+    // ------------------------------------------------------------------
+    // 测试 12：bt_update_progress 做种上限结束做种（Phase 3 修复 2）
+    // ------------------------------------------------------------------
+
+    /// seed-time 超上限：Seeding → Complete + bt-complete 事件 + 释放并发槽位
+    #[test]
+    fn bt_update_progress_ends_seeding_when_time_limit_reached() {
+        let (tm, repo, _temp) = test_manager(1);
+        let gid = "0123456789abcdef".to_string();
+        // 已做种 2 秒、seed-time=1 秒 → 上限已超
+        inject_seeding_task(&tm, &gid, None, Some(1), 2, 1000, 0);
+        let mut rx = tm.subscribe_events();
+
+        tm.bt_update_progress(&gid, &seeding_progress(1000, 0));
+
+        // 状态转 Complete + bt-complete 事件
+        assert_eq!(
+            repo.lock().unwrap().get(&gid).unwrap().status,
+            TaskStatus::Complete,
+            "做种时长达到 seed-time 上限后应结束做种"
+        );
+        let ev = rx.try_recv().expect("应收到 bt-complete 事件");
+        assert_eq!(ev.event, "bt-complete", "做种结束应发出 bt-complete 事件");
+        // 释放并发槽位 + 清理做种起始时刻
+        assert!(
+            !tm.bt_active.lock().unwrap().contains(&gid),
+            "做种结束应从运行集合移除（释放并发槽位）"
+        );
+        assert!(
+            !tm.bt_seed_started.lock().unwrap().contains_key(&gid),
+            "做种结束应清理做种起始时刻记录"
+        );
+    }
+
+    /// seed-ratio 超上限：同样结束做种（上传 / 下载比率达标）
+    #[test]
+    fn bt_update_progress_ends_seeding_when_ratio_limit_reached() {
+        let (tm, repo, _temp) = test_manager(1);
+        let gid = "0123456789abcdef".to_string();
+        // seed-ratio=2.0：上传 2000 字节 / 总量 1000 → 比率 2.0 达标
+        inject_seeding_task(&tm, &gid, Some(2.0), None, 0, 1000, 2000);
+        let mut rx = tm.subscribe_events();
+
+        tm.bt_update_progress(&gid, &seeding_progress(1000, 2000));
+
+        assert_eq!(
+            repo.lock().unwrap().get(&gid).unwrap().status,
+            TaskStatus::Complete,
+            "上传比率达到 seed-ratio 上限后应结束做种"
+        );
+        let ev = rx.try_recv().expect("应收到 bt-complete 事件");
+        assert_eq!(ev.event, "bt-complete");
+    }
+
+    /// 未达上限：保持 Seeding，不发 bt-complete，不释放槽位
+    #[test]
+    fn bt_update_progress_keeps_seeding_before_limit() {
+        let (tm, repo, _temp) = test_manager(1);
+        let gid = "0123456789abcdef".to_string();
+        // 已做种 1 秒但 seed-time=60、seed-ratio=10：均未达上限
+        inject_seeding_task(&tm, &gid, Some(10.0), Some(60), 1, 1000, 100);
+        let mut rx = tm.subscribe_events();
+
+        tm.bt_update_progress(&gid, &seeding_progress(1000, 100));
+
+        // 状态保持 Seeding、做种起始时刻保留、并发槽位保留、无 bt-complete 事件
+        assert_eq!(
+            repo.lock().unwrap().get(&gid).unwrap().status,
+            TaskStatus::Seeding,
+            "未达做种上限时应保持 Seeding"
+        );
+        assert!(tm.bt_seed_started.lock().unwrap().contains_key(&gid));
+        assert!(tm.bt_active.lock().unwrap().contains(&gid));
+        assert!(
+            matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+            "未达上限时不应发出任何事件"
+        );
+    }
+
+    /// 无限做种（seed-ratio / seed-time 均未设置）：保持 Seeding（由用户终止）
+    #[test]
+    fn bt_update_progress_keeps_seeding_without_limits() {
+        let (tm, repo, _temp) = test_manager(1);
+        let gid = "0123456789abcdef".to_string();
+        // 已做种 30 秒（超过任何常见上限时长），但 seed-ratio / seed-time 均未设置
+        inject_seeding_task(&tm, &gid, None, None, 30, 1000, 99999);
+
+        tm.bt_update_progress(&gid, &seeding_progress(1000, 99999));
+
+        assert_eq!(
+            repo.lock().unwrap().get(&gid).unwrap().status,
+            TaskStatus::Seeding,
+            "未设置做种上限时应无限做种（由用户暂停 / 移除终止）"
+        );
+    }
+
+    /// 首次下载完成的 keep-seeding 分支：置 Seeding + 记录做种起始时刻
+    #[test]
+    fn bt_update_progress_enters_seeding_records_start_time() {
+        let (tm, repo, _temp) = test_manager(1);
+        let gid = "0123456789abcdef".to_string();
+        // Active 下载中任务（keep-seeding 开启、finished 首轮为 true）
+        let mut task = Task::new_bt_task(
+            &gid,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "/tmp/dl",
+            Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        );
+        task.status = TaskStatus::Active;
+        task.total_length = 1000;
+        task.completed_length = 1000;
+        repo.lock().unwrap().add(task);
+        let mut opts = EngineOptions::default();
+        opts.keep_seeding = true;
+        tm.task_options.lock().unwrap().insert(gid.clone(), opts);
+        tm.bt_active.lock().unwrap().insert(gid.clone());
+
+        tm.bt_update_progress(&gid, &seeding_progress(1000, 0));
+
+        // 状态转 Seeding + 做种起始时刻已记录（供后续上限检查）
+        assert_eq!(
+            repo.lock().unwrap().get(&gid).unwrap().status,
+            TaskStatus::Seeding,
+            "keep-seeding 开启且下载完成应进入做种"
+        );
+        assert!(
+            tm.bt_seed_started.lock().unwrap().contains_key(&gid),
+            "进入做种时应记录做种起始时刻"
+        );
+        // 做种保留并发槽位（bt_active 不移除）
+        assert!(tm.bt_active.lock().unwrap().contains(&gid));
     }
 }

@@ -9,7 +9,8 @@
 //!   （等价 Electron 版 shell.showItemInFolder / shell.openPath / shell.trashItem）
 //!
 //! 任务操作命令已接入 motrix-core 真实引擎（TaskManager）：添加 / 暂停 / 恢复 / 删除
-//! 均由 KGet 引擎实际执行；add_torrent（BT）与 get_peers 属 Phase 3，返回明确占位。
+//! 均由 KGet / librqbit 引擎实际执行；add_torrent（BT）与 get_peers 属 Phase 3，
+//! 已实现真实行为（BT 任务创建 / peers 查询，见 MIGRATION-TAURI.md 5.5）。
 
 use serde_json::{json, Value};
 use tauri::State;
@@ -97,14 +98,14 @@ pub fn add_uri(
     state.task_manager.add_uri(&uris, &opts)
 }
 
-/// 添加种子任务：BT 下载支持属 Phase 3（librqbit），经 TaskManager 返回明确占位错误
+/// 添加种子任务（真实引擎）：BT 经 TaskManager → librqbit（Phase 3）
 #[tauri::command]
 pub fn add_torrent(
     state: State<'_, AppState>,
     torrent: String,
     options: Option<Value>,
 ) -> Result<String, String> {
-    debug!("[Motrix] add_torrent 调用（BT 属 Phase 3，暂未支持）");
+    debug!("[Motrix] add_torrent 调用（magnet / base64 .torrent → librqbit）");
     let opts = options.unwrap_or(Value::Null);
     state.task_manager.add_torrent(&torrent, &opts)
 }
@@ -221,6 +222,10 @@ pub fn get_tasks(state: State<'_, AppState>) -> Result<Value, String> {
 }
 
 /// 获取任务详情：按 gid 返回单任务 aria2 兼容 JSON；不存在返回 null
+///
+/// BT 任务的 `bitfield` 字段已在 bt.rs 的进度轮询时**降采样**为 ≤240 个十六进制
+/// 字符并存储于 Task.bitfield（见 MIGRATION-TAURI.md 5.8：根治 Electron 版大
+/// bitfield 白屏），此处 to_aria2() 直接输出该降采样值，无需额外处理。
 #[tauri::command]
 pub fn get_task_detail(state: State<'_, AppState>, gid: String) -> Result<Value, String> {
     let repo = state
@@ -231,12 +236,30 @@ pub fn get_task_detail(state: State<'_, AppState>, gid: String) -> Result<Value,
     Ok(repo.get(&gid).map(|t| t.to_aria2()).unwrap_or(Value::Null))
 }
 
-/// 获取任务 peers 列表（占位）：返回空数组（BT peers 支持属 Phase 3）
+/// 获取任务 peers 列表（aria2.getPeers 兼容）：经 TaskManager 查询 BT 引擎
+///
+/// 返回字段（数值为字符串，aria2 惯例）：ip / port / peerId / bitfield /
+/// downloadSpeed / uploadSpeed；默认最多 100 条（分页硬约束）。
+/// 注：librqbit 8.1.1 未在公开 API 暴露 per-peer 明细，当前返回空数组
+/// （契约 / 分页逻辑保留，待 librqbit 上游提供 per-peer stats 后填充）。
 #[tauri::command]
-pub fn get_peers(gid: String) -> Result<Value, String> {
-    let _ = gid;
-    debug!("[Motrix] get_peers 调用（BT 属 Phase 3，返回空列表）");
-    Ok(json!([]))
+pub fn get_peers(state: State<'_, AppState>, gid: String) -> Result<Value, String> {
+    debug!("[Motrix] get_peers 调用：gid={gid}");
+    let peers = state.task_manager.get_peers(&gid, 100);
+    let list: Vec<Value> = peers
+        .iter()
+        .map(|p| {
+            json!({
+                "ip": p.ip,
+                "port": p.port.to_string(),
+                "peerId": p.peer_id,
+                "bitfield": p.bitfield,
+                "downloadSpeed": p.download_speed.to_string(),
+                "uploadSpeed": p.upload_speed.to_string(),
+            })
+        })
+        .collect();
+    Ok(json!(list))
 }
 
 /// 保存会话（等价 aria2.saveSession）：把任务仓库写入 checkpoint.json

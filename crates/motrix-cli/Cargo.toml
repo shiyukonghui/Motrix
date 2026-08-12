@@ -1,0 +1,29 @@
+[package]
+name = "motrix-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Motrix 命令行工具：作为 JSON-RPC 客户端远程控制 Motrix 下载引擎，并支持无头 daemon 模式（Phase 5，见 MIGRATION-TAURI.md 第 9 章）"
+license = "MIT"
+
+[dependencies]
+# 参数解析（clap derive，见 MIGRATION-TAURI.md 9.6 实现要点）
+clap = { workspace = true }
+# 结构化输出（--json 透传 RPC result）与 system.json 读取
+serde_json = { workspace = true }
+# 核心库（Phase 5 Task 12）：daemon 无头模式复用 motrix-core 的 ConfigManager /
+# TaskManager / session / rpc_backend（CoreRpcBackend），与 GUI 共享同一份引擎代码；
+# 数据目录定位统一走 motrix_core::config::data_dir()（不再用 dirs 自实现）
+motrix-core = { path = "../motrix-core" }
+# 轻量 JSON-RPC 客户端（服务端与本客户端共用 motrix-rpc crate）
+motrix-rpc = { path = "../motrix-rpc" }
+# .torrent 文件 → base64（aria2.addTorrent 契约，params[0] 为 base64 编码的 torrent 文件）
+base64 = { workspace = true }
+# daemon 无头模式（Phase 5 Task 12）：tokio runtime 驱动 RPC 服务、端口探测
+# （TcpListener::bind）与 Ctrl+C 信号监听（signal feature 为 tokio::signal::ctrl_c 所需）
+tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+# 端到端测试（tests/e2e.rs）：进程内启动 axum Router 驱动的 RPC 服务
+# （JsonRpcServer::serve 不暴露系统分配端口的实际值，测试用 router + axum::serve +
+# TcpListener::bind("127.0.0.1:0") 自行绑定拿端口），axum 已在 workspace 统一声明
+axum = { workspace = true }

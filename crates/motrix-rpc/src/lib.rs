@@ -8,8 +8,9 @@
 //! - [server]：  axum WS + HTTP POST 双通道服务器（[JsonRpcServer]）
 //! - [methods]： JSON-RPC 协议层（请求解析 / token 认证 / system.* 方法 / 响应包装）
 //! - [notify]：  通知骨架（onDownloadStart 等广播，Phase 2 接入真实推送）
-//! - client：    轻量 JSON-RPC 客户端（供 motrix-cli 复用，Phase 5 实现）
+//! - [client]：  轻量 JSON-RPC 客户端（供 motrix-cli 复用，HTTP POST 通道）
 
+pub mod client;
 pub mod methods;
 pub mod notify;
 pub mod server;

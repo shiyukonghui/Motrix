@@ -95,8 +95,12 @@ pub struct TaskFile {
 pub struct BittorrentInfo {
     /// 下载模式：single（单文件）/ multi（多文件）
     pub mode: String,
-    /// 种子名称（bittorrent.info.name）
-    pub info_name: String,
+    /// 种子名称（bittorrent.info.name）。
+    ///
+    /// 磁力链接任务在 **metadata 获取前为 None**：此时 to_aria2() 省略 `info` 键，
+    /// 前端 `isMagnetTask = (task) => bittorrent && !bittorrent.info` 据此判断
+    /// （对应 MIGRATION-TAURI.md 5.5 节"磁力先以 metadata 任务呈现"）。
+    pub info_name: Option<String>,
     /// announce 服务器列表（对应 announceList）
     pub announce_list: Vec<Vec<String>>,
     /// 信息哈希（对应顶层 infoHash 字段，可选）
@@ -200,6 +204,64 @@ impl Task {
         }
     }
 
+    /// 构造 BT 任务（Phase 3：磁力 / 种子任务）
+    ///
+    /// - `gid`: 任务 id（通常由 [`generate_gid`] 生成）
+    /// - `source`: BT 源（magnet 链接 或 base64 编码的 .torrent 内容），
+    ///   存入 `files[0].uris[0]`，供 BT 引擎重新加入（checkpoint 恢复 / 续传）时取源；
+    /// - `dir`: 保存目录
+    /// - `info_hash`: 40 位十六进制信息哈希（磁力预解析 / 种子解析结果；未知时传 None，
+    ///   由 metadata 就绪回调补填）
+    ///
+    /// 构造后 `bittorrent` 存在但 `info_name` 为 None（磁力 metadata 阶段前端据此
+    /// 判定 isMagnetTask），total_length=0，由后续 metadata / 进度回调填充。
+    pub fn new_bt_task(
+        gid: impl Into<String>,
+        source: &str,
+        dir: impl Into<String>,
+        info_hash: Option<String>,
+    ) -> Self {
+        let gid = gid.into();
+        let dir = dir.into();
+        let task = Self {
+            gid: gid.clone(),
+            status: TaskStatus::Waiting,
+            total_length: 0,
+            completed_length: 0,
+            upload_length: 0,
+            download_speed: 0,
+            upload_speed: 0,
+            dir: dir.clone(),
+            files: vec![TaskFile {
+                index: 1,
+                // BT 任务保存路径占位（metadata 就绪后按文件列表重建）；源写入 uris[0]
+                path: format!("{dir}/"),
+                length: 0,
+                completed_length: 0,
+                selected: true,
+                uris: vec![(source.to_string(), "used".to_string())],
+            }],
+            bittorrent: Some(BittorrentInfo {
+                // 占位 mode（metadata 就绪后按文件数更新为 single / multi）
+                mode: "single".to_string(),
+                info_name: None,
+                announce_list: Vec::new(),
+                info_hash,
+            }),
+            error_code: None,
+            error_message: None,
+            connections: 0,
+            bitfield: String::new(),
+            num_seeders: 0,
+            seeder: false,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        task
+    }
+
     /// 任务进度百分比（0.0 ~ 100.0；total_length 为 0 时返回 0）
     pub fn percent(&self) -> f64 {
         if self.total_length == 0 {
@@ -274,13 +336,17 @@ impl Task {
             })
             .collect();
 
-        // BT 元信息（可选）：announceList / mode / info.name
+        // BT 元信息（可选）：announceList / mode / info.name。
+        // metadata 获取前（磁力任务）info_name 为 None → **省略 info 键**，
+        // 前端 isMagnetTask 依据 `bittorrent && !bittorrent.info` 判断。
         let bittorrent = self.bittorrent.as_ref().map(|b| {
-            json!({
-                "announceList": b.announce_list,
-                "mode": b.mode,
-                "info": { "name": b.info_name },
-            })
+            let mut obj = serde_json::Map::new();
+            obj.insert("announceList".to_string(), json!(b.announce_list));
+            obj.insert("mode".to_string(), json!(b.mode));
+            if let Some(name) = &b.info_name {
+                obj.insert("info".to_string(), json!({ "name": name }));
+            }
+            Value::Object(obj)
         });
         // 错误信息：无错误时为 null，有错误时为字符串
         let error_code = self.error_code.map(|c| c.to_string());
@@ -375,6 +441,11 @@ impl TaskRepository {
     /// 按 gid 查询任务
     pub fn get(&self, gid: &str) -> Option<&Task> {
         self.tasks.get(gid)
+    }
+
+    /// 按 gid 查询任务（可变引用；BT 进度回调 / metadata 就绪更新字段用）
+    pub fn get_mut(&mut self, gid: &str) -> Option<&mut Task> {
+        self.tasks.get_mut(gid)
     }
 
     /// 是否包含指定 gid 的任务
@@ -745,7 +816,7 @@ mod tests {
         task.transition(TaskStatus::Seeding).unwrap();
         task.bittorrent = Some(BittorrentInfo {
             mode: "multi".to_string(),
-            info_name: "ubuntu-24.04".to_string(),
+            info_name: Some("ubuntu-24.04".to_string()),
             announce_list: vec![
                 vec!["udp://tracker1:80".to_string()],
                 vec!["udp://tracker2:80".to_string()],
@@ -767,6 +838,39 @@ mod tests {
             bt["announceList"],
             json!([["udp://tracker1:80"], ["udp://tracker2:80"]])
         );
+    }
+
+    #[test]
+    fn to_aria2_magnet_metadata_pending_omits_info_key() {
+        // 磁力 metadata 阶段（Phase 3）：bittorrent 存在但 info_name 为 None，
+        // to_aria2 必须**省略 info 键**（前端 isMagnetTask 据此判断）
+        let mut task = task_with_gid("magnet0000000001");
+        task.transition(TaskStatus::Active).unwrap();
+        task.bittorrent = Some(BittorrentInfo {
+            mode: "single".to_string(),
+            info_name: None,
+            announce_list: Vec::new(),
+            info_hash: Some("cafebabecafebabecafebabecafebabecafebabe".to_string()),
+        });
+
+        let v = task.to_aria2();
+        let bt = v["bittorrent"].as_object().expect("bittorrent 应为对象");
+        assert_eq!(bt["mode"], "single");
+        assert_eq!(
+            bt["announceList"],
+            json!([]),
+            "metadata 阶段 announceList 为空数组"
+        );
+        assert!(
+            !bt.contains_key("info"),
+            "metadata 阶段不应输出 info 键（前端 isMagnetTask 依赖）"
+        );
+        // 顶层 infoHash 仍可用（磁力链接预解析得到）
+        assert_eq!(v["infoHash"], "cafebabecafebabecafebabecafebabecafebabe");
+        // info 键补齐后（metadata 就绪）恢复输出
+        task.bittorrent.as_mut().unwrap().info_name = Some("debian-12".to_string());
+        let v2 = task.to_aria2();
+        assert_eq!(v2["bittorrent"]["info"]["name"], "debian-12");
     }
 
     #[test]
